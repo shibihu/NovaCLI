@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0e14">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="NovaCLI — AI-powered developer environment.">
+  <title>NovaCLI · {{ project_name }}</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <!-- Top bar ------------------------------------------------------------ -->
+  <header class="topbar" id="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">⚡</span>
+      <span class="brand-name">NovaCLI</span>
+      <span class="brand-version">v{{ version }}</span>
+    </div>
+    <div class="chips">
+      <span class="chip" id="chip-model" title="Active model">{{ model }}</span>
+      <span class="chip chip-safety" id="chip-safety" title="Safety mode">{{ safety_mode }}</span>
+      <span class="chip chip-status" id="chip-status" data-state="pending">…</span>
+    </div>
+  </header>
+
+  <!-- Setup banner (shown when no API key) ------------------------------- -->
+  <div class="banner hidden" id="setup-banner" role="alert">
+    <strong>No API key configured.</strong>
+    <p>
+      Run <code>nova init</code>, then put your key from
+      <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>
+      into <code>.env</code> as <code>GROQ_API_KEY=gsk_…</code> and restart the server.
+    </p>
+  </div>
+
+  <main id="main">
+    <!-- Chat ------------------------------------------------------------ -->
+    <section class="view is-active" id="view-chat" role="tabpanel" aria-label="Chat">
+      <div class="messages" id="messages" aria-live="polite">
+        <div class="empty" id="chat-empty">
+          <h2>Ask Nova about this project</h2>
+          <p class="muted">It reads files, searches code, runs commands and reports every step.</p>
+          <div class="suggestions" id="suggestions">
+            <button type="button" class="suggestion">Explain what this project does</button>
+            <button type="button" class="suggestion">Find and fix the most likely bug</button>
+            <button type="button" class="suggestion">Write tests for the core module and run them</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="progress hidden" id="progress" aria-hidden="true">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+
+      <form class="composer" id="composer" autocomplete="off">
+        <label class="sr-only" for="task">Task</label>
+        <textarea
+          id="task"
+          name="task"
+          rows="1"
+          placeholder="Ask Nova to build, fix or explain…"
+          enterkeyhint="send"
+          spellcheck="false"></textarea>
+        <button type="submit" id="send" class="btn btn-primary" aria-label="Send task">Send</button>
+        <button type="button" id="stop" class="btn btn-danger hidden" aria-label="Stop the agent">Stop</button>
+      </form>
+    </section>
+
+    <!-- Files ----------------------------------------------------------- -->
+    <section class="view" id="view-files" role="tabpanel" aria-label="Files">
+      <div class="toolbar">
+        <button type="button" class="btn btn-ghost" id="files-up" aria-label="Parent directory">↑ Up</button>
+        <span class="path-label" id="files-path">.</span>
+        <button type="button" class="btn btn-ghost" id="files-refresh" aria-label="Refresh">⟳</button>
+      </div>
+      <div class="split">
+        <ul class="file-list" id="file-list"></ul>
+        <div class="editor hidden" id="editor-pane">
+          <div class="toolbar">
+            <span class="path-label" id="editor-path"></span>
+            <span class="muted small" id="editor-meta"></span>
+            <button type="button" class="btn btn-primary" id="editor-save">Save</button>
+            <button type="button" class="btn btn-ghost" id="editor-close">Close</button>
+          </div>
+          <textarea id="editor" spellcheck="false" autocapitalize="off" autocorrect="off"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- Terminal -------------------------------------------------------- -->
+    <section class="view" id="view-term" role="tabpanel" aria-label="Terminal">
+      <div class="terminal" id="terminal-out"></div>
+      <form class="composer" id="term-form" autocomplete="off">
+        <label class="sr-only" for="term-input">Command</label>
+        <input id="term-input" name="command" placeholder="pytest -q" spellcheck="false" autocapitalize="off">
+        <button type="submit" class="btn btn-primary">Run</button>
+      </form>
+    </section>
+
+    <!-- Project --------------------------------------------------------- -->
+    <section class="view" id="view-project" role="tabpanel" aria-label="Project">
+      <div class="toolbar">
+        <span class="path-label">Project overview</span>
+        <button type="button" class="btn btn-ghost" id="project-refresh">⟳</button>
+      </div>
+      <div class="cards" id="project-cards"></div>
+      <pre class="tree" id="project-tree"></pre>
+    </section>
+  </main>
+
+  <!-- Bottom navigation --------------------------------------------------- -->
+  <nav class="tabbar" role="tablist" aria-label="Sections">
+    <button class="tab is-active" role="tab" data-view="chat" aria-selected="true">
+      <span class="tab-icon" aria-hidden="true">💬</span><span>Chat</span>
+    </button>
+    <button class="tab" role="tab" data-view="files" aria-selected="false">
+      <span class="tab-icon" aria-hidden="true">📁</span><span>Files</span>
+    </button>
+    <button class="tab" role="tab" data-view="term" aria-selected="false">
+      <span class="tab-icon" aria-hidden="true">▸_</span><span>Terminal</span>
+    </button>
+    <button class="tab" role="tab" data-view="project" aria-selected="false">
+      <span class="tab-icon" aria-hidden="true">📊</span><span>Project</span>
+    </button>
+  </nav>
+
+  <!-- Approval modal ------------------------------------------------------ -->
+  <div class="modal hidden" id="approval-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+    <div class="modal-card">
+      <h3 id="approval-title">⚠ Nova needs permission</h3>
+      <p class="approval-summary" id="approval-summary"></p>
+      <p class="muted small" id="approval-reason"></p>
+      <pre class="approval-detail" id="approval-detail"></pre>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-primary" id="approve-once">Approve</button>
+        <button type="button" class="btn btn-ghost" id="approve-always">Always allow</button>
+        <button type="button" class="btn btn-danger" id="approve-deny">Deny</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast" role="status"></div>
+
+  <script src="/static/js/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# ---------------------------------------------------------------------------
+# NovaCLI v1.0 — runtime dependencies
+#
+# Termux / Android note:
+#   * Use plain `uvicorn`, NOT `uvicorn[standard]`. The "standard" extra pulls
+#     in uvloop + httptools, which need a C toolchain and frequently fail to
+#     build on Android. Plain uvicorn runs on the pure-Python asyncio loop and
+#     is plenty fast for a single-user mobile IDE.
+#   * Everything listed here is pure Python, so `pip install -r
+#     requirements.txt` works on Termux without clang/rust.
+# ---------------------------------------------------------------------------
+
+groq>=0.11.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+jinja2>=3.1.4
+pydantic>=2.7.0
