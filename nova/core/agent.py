@@ -343,12 +343,12 @@ class ToolBox:
         if self.spec(name) is None:
             return ToolOutcome(
                 ok=False,
-                error=f"Unknown tool {name!r}. Available tools: {', '.join(sorted(TOOL_NAMES))}",
+                error=f"Tool execution failed: unknown tool {name!r}. Available tools: {', '.join(sorted(TOOL_NAMES))}",
             )
         try:
             handler = getattr(self, f"_tool_{name}")
         except AttributeError:
-            return ToolOutcome(ok=False, error=f"Tool {name!r} is not implemented.")
+            return ToolOutcome(ok=False, error=f"Tool execution failed: {name!r} is not implemented.")
 
         try:
             result = handler(args)
@@ -666,7 +666,7 @@ class NovaAgent:
                     }
                     for tc in ai_response.tool_calls
                 ]
-                messages.append(Message.assistant(content=ai_response.text or "", tool_calls=assistant_tool_calls))
+                messages.append(Message.assistant(content=ai_response.text or None, tool_calls=assistant_tool_calls))
 
                 for tc in ai_response.tool_calls:
                     action = tc.name
@@ -678,6 +678,26 @@ class NovaAgent:
                         {"tool": action, "input": arguments},
                         step=index,
                     )
+
+                    # Handle malformed arguments
+                    if arguments.get("_invalid_json"):
+                        reason = f"Tool argument parsing failed: invalid JSON arguments: {arguments.get('raw')!r}"
+                        yield AgentEvent(
+                            EventType.BLOCKED,
+                            {"tool": action, "reason": reason, "input": arguments},
+                            step=index,
+                        )
+                        result = ToolResult(
+                            name=action, ok=False, blocked=True, error=reason, tool_call_id=tool_call_id
+                        )
+                        steps.append(
+                            AgentStep(
+                                index=index, thought="", action=action,
+                                action_input=arguments, result=result,
+                            )
+                        )
+                        messages.append(Message.tool_result(tool_call_id, action, f"ERROR: {reason}"))
+                        continue
 
                     # Safety check
                     verdict: SafetyVerdict | None = None
@@ -736,7 +756,7 @@ class NovaAgent:
                                         action_input=arguments, result=result,
                                     )
                                 )
-                                messages.append(Message.tool_result(tool_call_id, action, f"DENIED: {reason}"))
+                                messages.append(Message.tool_result(tool_call_id, action, f"DENIED by user: {reason}"))
                                 continue
 
                     # Execute tool

@@ -49,7 +49,7 @@ class FakeClient:
 
 @pytest.fixture
 def provider() -> GroqProvider:
-    return GroqProvider(SECRET, "llama-3.3-70b-versatile", client=FakeClient())
+    return GroqProvider(SECRET, "openai/gpt-oss-20b", client=FakeClient())
 
 
 # --- Protocol conformance ---------------------------------------------------
@@ -74,14 +74,14 @@ def test_get_provider_rejects_unknown_names() -> None:
 
 
 def test_default_model_constant() -> None:
-    assert DEFAULT_MODEL == "llama-3.3-70b-versatile"
+    assert DEFAULT_MODEL == "openai/gpt-oss-20b"
 
 
 # --- Introspection ----------------------------------------------------------
 
 
 def test_model_name(provider: GroqProvider) -> None:
-    assert provider.model_name == "llama-3.3-70b-versatile"
+    assert provider.model_name == "openai/gpt-oss-20b"
 
 
 def test_configured_is_true_with_a_key(provider: GroqProvider) -> None:
@@ -155,7 +155,7 @@ async def test_complete_strips_whitespace() -> None:
     assert res.text == "spaced"
 
 
-# --- Native Tools -----------------------------------------------------------
+# --- Native Tools & Reasoning Effort ----------------------------------------
 
 
 async def test_complete_with_native_tools() -> None:
@@ -176,6 +176,13 @@ async def test_complete_with_native_tools() -> None:
     assert res.tool_calls[0].name == "read_file"
     assert res.tool_calls[0].arguments == {"path": "main.py"}
     assert client.calls[0]["tool_choice"] == "auto"
+
+
+async def test_complete_passes_reasoning_effort_for_gpt_oss() -> None:
+    client = FakeClient()
+    provider = GroqProvider(SECRET, model="openai/gpt-oss-20b", reasoning_effort="medium", client=client)
+    await provider.complete([{"role": "user", "content": "hi"}])
+    assert client.calls[0].get("reasoning_effort") == "medium"
 
 
 # --- Failure modes ----------------------------------------------------------

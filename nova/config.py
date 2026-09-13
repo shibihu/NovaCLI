@@ -23,7 +23,7 @@ from typing import Mapping
 
 # --- Defaults ---------------------------------------------------------------
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_STEPS = 8
 DEFAULT_HOST = "127.0.0.1"
@@ -199,6 +199,7 @@ class Settings:
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT
     api_key_source: str = "none"
+    reasoning_effort: str | None = None
     extra_ignore: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
 
@@ -235,6 +236,7 @@ class Settings:
             "has_api_key": self.has_api_key,
             "api_key_preview": self.masked_api_key,
             "api_key_source": self.api_key_source,
+            "reasoning_effort": self.reasoning_effort,
         }
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -334,6 +336,12 @@ def load_settings(
     if safety_mode not in VALID_SAFETY_MODES:
         safety_mode = "smart"
 
+    reasoning_effort = layered("NOVA_REASONING_EFFORT")
+    if reasoning_effort and reasoning_effort.lower() in {"low", "medium", "high"}:
+        reasoning_effort = reasoning_effort.lower()
+    else:
+        reasoning_effort = None
+
     settings = Settings(
         groq_api_key=api_key,
         groq_model=_as_str(model, DEFAULT_MODEL),
@@ -358,6 +366,7 @@ def load_settings(
             )
         ),
         api_key_source=key_source,
+        reasoning_effort=reasoning_effort,
         environment=dict(environ),
     )
 

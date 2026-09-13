@@ -16,7 +16,7 @@ from nova.core.models import AIResponse, ToolCall
 
 from . import AIProviderError, MissingAPIKeyError
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.2
@@ -35,6 +35,7 @@ class GroqProvider:
         timeout: float = DEFAULT_TIMEOUT,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
+        reasoning_effort: str | None = None,
         client: Any | None = None,
     ) -> None:
         self._api_key = (api_key or "").strip() or None
@@ -42,6 +43,7 @@ class GroqProvider:
         self._timeout = max(1.0, float(timeout))
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
         self._client = client
         self._owns_client = client is None
 
@@ -120,6 +122,9 @@ class GroqProvider:
             "temperature": self._temperature,
         }
 
+        if self._reasoning_effort and "gpt-oss" in target_model.lower():
+            kwargs["reasoning_effort"] = self._reasoning_effort
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -177,32 +182,39 @@ class GroqProvider:
         if message is None:
             raise AIProviderError("Groq response contained no message.")
 
-        # Check for native tool calls
         raw_tool_calls = getattr(message, "tool_calls", None)
         parsed_tool_calls: list[ToolCall] = []
 
         if raw_tool_calls:
             for tc in raw_tool_calls:
-                call_id = getattr(tc, "id", None) or getattr(tc, "tool_call_id", "") or "call_unknown"
+                call_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else "") or "call_unknown"
                 func = getattr(tc, "function", None)
                 if not func and isinstance(tc, dict):
-                    call_id = tc.get("id") or tc.get("tool_call_id") or "call_unknown"
                     func = tc.get("function")
 
                 name = ""
                 args: dict[str, Any] = {}
+                parse_error = False
+
                 if func:
-                    name = getattr(func, "name", None) or func.get("name", "") if isinstance(func, dict) else getattr(func, "name", "")
+                    name = getattr(func, "name", None) or (func.get("name") if isinstance(func, dict) else "") or ""
                     raw_args = getattr(func, "arguments", None) if not isinstance(func, dict) else func.get("arguments")
+
                     if isinstance(raw_args, str):
                         try:
                             parsed_args = json.loads(raw_args)
                             if isinstance(parsed_args, dict):
                                 args = parsed_args
+                            else:
+                                args = {"_invalid_json": True, "raw": raw_args}
+                                parse_error = True
                         except ValueError:
-                            args = {"raw": raw_args}
+                            args = {"_invalid_json": True, "raw": raw_args}
+                            parse_error = True
                     elif isinstance(raw_args, dict):
                         args = raw_args
+                    elif raw_args is None:
+                        args = {}
 
                 if name:
                     parsed_tool_calls.append(ToolCall(id=str(call_id), name=str(name), arguments=args))

@@ -213,7 +213,7 @@ async def test_unknown_tool_is_reported_to_the_model(make_agent) -> None:
 
     results = [e for e in events if e.type == EventType.TOOL_RESULT]
     assert results[0].data["ok"] is False
-    assert "Unknown tool" in results[0].data["error"]
+    assert "unknown tool" in results[0].data["error"].lower()
 
 
 async def test_forbidden_action_is_blocked_without_running(make_agent, tmp_path: Path) -> None:
