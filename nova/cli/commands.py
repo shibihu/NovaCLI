@@ -44,7 +44,6 @@ from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyError, SafetyPolicy
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
-from nova.workspace.snapshot import SnapshotManager
 from nova.intelligence.cache import IntelligenceCache
 
 # ---------------------------------------------------------------------------
@@ -275,11 +274,6 @@ def cmd_ask(args: argparse.Namespace, console: Console) -> int:
         console.error("Nothing to do — provide a task, e.g. `nova ask \"explain this project\"`.")
         return 2
 
-    # Create automatic task checkpoint before starting
-    workspace = _make_workspace(settings)
-    snap_mgr = SnapshotManager(workspace)
-    snap_mgr.create_snapshot(description=f"ask: {task[:40]}")
-
     agent = None
     try:
         settings.require_api_key()
@@ -506,33 +500,6 @@ def cmd_summary(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
-def cmd_checkpoint(args: argparse.Namespace, console: Console) -> int:
-    """Create a task checkpoint/snapshot."""
-    settings = _settings_from_args(args)
-    workspace = _make_workspace(settings)
-    mgr = SnapshotManager(workspace)
-    desc = getattr(args, "description", None) or "manual_checkpoint"
-    snap = mgr.create_snapshot(description=desc)
-    console.ok(f"Created checkpoint {snap.id} ({len(snap.files)} file(s)) — '{desc}'")
-    return 0
-
-
-def cmd_undo(args: argparse.Namespace, console: Console) -> int:
-    """Roll back to the latest or specified checkpoint."""
-    settings = _settings_from_args(args)
-    workspace = _make_workspace(settings)
-    mgr = SnapshotManager(workspace)
-    snapshot_id = getattr(args, "snapshot_id", None)
-    restored = mgr.restore_snapshot(snapshot_id)
-
-    if not restored:
-        console.error("No checkpoint available to restore.")
-        return 1
-
-    console.ok(f"Restored workspace from checkpoint {restored.id} ('{restored.description}')")
-    return 0
-
-
 def cmd_project(args: argparse.Namespace, console: Console) -> int:
     """Project Intelligence 2.0 CLI command."""
     settings = _settings_from_args(args)
@@ -703,7 +670,7 @@ def cmd_init(args: argparse.Namespace, console: Console) -> int:
         [
             "# NovaCLI configuration — created by `nova init`",
             "GROQ_API_KEY=",
-            "GROQ_MODEL=openai/gpt-oss-20b",
+            "GROQ_MODEL=llama-3.3-70b-versatile",
             f"NOVA_PROJECT_ROOT={target}",
             "NOVA_COMMAND_TIMEOUT=30",
             "NOVA_MAX_STEPS=8",
@@ -733,10 +700,6 @@ def cmd_serve(args: argparse.Namespace, console: Console) -> int:
 
     host = args.host or settings.host
     port = args.port or settings.port
-
-    if host == "0.0.0.0" and not settings.has_web_token:
-        console.warn("⚠ WARNING: Binding to 0.0.0.0 without NOVA_WEB_TOKEN configured.")
-        console.warn("  Set NOVA_WEB_TOKEN in your environment or .env for LAN security.")
 
     console.title(f"NovaCLI web IDE · http://{host}:{port}")
     console.write(console.paint(f"  workspace {settings.project_root}", "dim"))
@@ -863,14 +826,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_summary = add("summary", "Show what NovaCLI understands about the project.")
     p_summary.set_defaults(func=cmd_summary)
-
-    p_checkpoint = add("checkpoint", "Create a task checkpoint/snapshot.")
-    p_checkpoint.add_argument("description", nargs="?", default="manual_checkpoint")
-    p_checkpoint.set_defaults(func=cmd_checkpoint)
-
-    p_undo = add("undo", "Roll back to the latest or specified task checkpoint.")
-    p_undo.add_argument("snapshot_id", nargs="?", default=None)
-    p_undo.set_defaults(func=cmd_undo)
 
     p_project = add("project", "Project Intelligence 2.0 details.")
     p_project_sub = p_project.add_subparsers(dest="project_subcommand")
