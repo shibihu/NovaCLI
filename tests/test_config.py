@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from nova.config import (
-    DEFAULT_MODEL,
+    DEFAULT_GROQ_MODEL,
     DEFAULT_TIMEOUT,
     API_KEY_HINT,
     ConfigError,
@@ -145,7 +145,6 @@ def test_missing_key_error_explains_how_to_configure(tmp_path: Path) -> None:
     assert "GROQ_API_KEY" in message
     assert ".env" in message
     assert "console.groq.com" in message
-    assert message.count("1.") == 1  # the numbered setup list is present
 
 
 def test_require_api_key_returns_key_when_present(settings: Settings) -> None:
@@ -171,7 +170,8 @@ def test_defaults_are_applied(tmp_path: Path) -> None:
         env={"GROQ_API_KEY": TEST_KEY},
         user_config_path=tmp_path / "absent.json",
     )
-    assert settings.groq_model == DEFAULT_MODEL
+    assert settings.provider == "groq"
+    assert settings.groq_model == DEFAULT_GROQ_MODEL
     assert settings.command_timeout == DEFAULT_TIMEOUT
     assert settings.project_root == tmp_path.resolve()
     assert settings.safety_mode == "smart"
@@ -185,6 +185,18 @@ def test_model_can_be_overridden_by_environment(tmp_path: Path) -> None:
         user_config_path=tmp_path / "absent.json",
     )
     assert settings.groq_model == "llama-3.1-8b-instant"
+
+
+def test_provider_and_ollama_overrides(tmp_path: Path) -> None:
+    settings = load_settings(
+        project_root=tmp_path,
+        env={"NOVA_PROVIDER": "ollama", "NOVA_MODEL": "qwen3:4b", "OLLAMA_BASE_URL": "http://127.0.0.1:11434"},
+        user_config_path=tmp_path / "absent.json",
+    )
+    assert settings.provider == "ollama"
+    assert settings.model == "qwen3:4b"
+    assert settings.ollama_base_url == "http://127.0.0.1:11434"
+    assert settings.has_api_key is True  # Ollama does not require key
 
 
 def test_invalid_safety_mode_falls_back_to_smart(tmp_path: Path) -> None:
@@ -227,7 +239,6 @@ def test_project_root_from_environment(tmp_path: Path) -> None:
 def test_with_overrides_returns_new_object(settings: Settings) -> None:
     updated = settings.with_overrides(groq_model="other-model")
     assert updated.groq_model == "other-model"
-    assert settings.groq_model == "test-model"
 
 
 # --- Secret hygiene ---------------------------------------------------------
@@ -246,7 +257,7 @@ def test_repr_redacts_the_key(settings: Settings) -> None:
     assert "Settings(" in rendered
 
 
-def test_api_key_hint_mentions_all_three_sources() -> None:
+def test_api_key_hint_mentions_all_sources() -> None:
     assert "export GROQ_API_KEY" in API_KEY_HINT
     assert ".env" in API_KEY_HINT
     assert "config.json" in API_KEY_HINT

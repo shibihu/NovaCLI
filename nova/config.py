@@ -1,29 +1,31 @@
 """Configuration loading for NovaCLI.
 
-Resolution order for the API key (highest priority first):
+Resolution order for configuration and credentials (highest priority first):
 
-1. ``GROQ_API_KEY`` environment variable
-2. ``.env`` file in the project root
-3. ``~/.nova/credentials.json`` (``{"groq_api_key": "gsk_..."}``)
-4. ``~/.nova/config.json`` (``{"groq_api_key": "gsk_..."}``)
-
-Secrets are never logged, never returned to the browser and never placed in
-the project context handed to the model. Every external representation of a
-:class:`Settings` object goes through :meth:`Settings.to_public_dict`, which
-replaces the key with a boolean + masked preview.
+1. Explicit CLI arguments / overrides
+2. Environment variables (NOVA_PROVIDER, NOVA_MODEL, OLLAMA_BASE_URL, GROQ_API_KEY, GROQ_MODEL)
+3. Project .env file
+4. Global user credentials (~/.nova/credentials.json)
+5. Global user config (~/.nova/config.json)
+6. Defaults
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
 # --- Defaults ---------------------------------------------------------------
 
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_PROVIDER = "groq"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
+DEFAULT_OLLAMA_MODEL = "qwen3:4b"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_STEPS = 8
 DEFAULT_HOST = "127.0.0.1"
@@ -41,10 +43,11 @@ DEFAULT_USER_CONFIG_PATH = Path.home() / ".nova" / "config.json"
 DEFAULT_USER_CREDENTIALS_PATH = Path.home() / ".nova" / "credentials.json"
 
 VALID_SAFETY_MODES = ("smart", "strict", "permissive")
+VALID_PROVIDERS = ("groq", "ollama")
 
 API_KEY_HINT = f"""No Groq API key configured.
 
-NovaCLI needs a key to talk to the model. Set it in any ONE of these places
+NovaCLI needs a key to talk to Groq. Set it in any ONE of these places
 (highest priority first):
 
   1. Environment variable:
@@ -93,14 +96,18 @@ class NovaConfigStore:
 
     def save_config(self, data: dict[str, object]) -> None:
         self.nova_dir.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        current = self.load_config()
+        current.update(data)
+        self.config_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
     def load_credentials(self) -> dict[str, object]:
         return read_user_config(self.credentials_path)
 
     def save_credentials(self, data: dict[str, object]) -> None:
         self.nova_dir.mkdir(parents=True, exist_ok=True)
-        text = json.dumps(data, indent=2)
+        current = self.load_credentials()
+        current.update(data)
+        text = json.dumps(current, indent=2)
         if os.name == "posix":
             fd = os.open(self.credentials_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with open(fd, "w", encoding="utf-8") as f:
@@ -111,6 +118,27 @@ class NovaConfigStore:
                 pass
         else:
             self.credentials_path.write_text(text, encoding="utf-8")
+
+
+def prompt_and_save_api_key(store: NovaConfigStore | None = None) -> str:
+    """Prompt the user for a missing Groq API key interactively in TTY and save it globally."""
+    store = store or NovaConfigStore()
+    if not sys.stdin.isatty():
+        raise ConfigError(API_KEY_HINT)
+
+    print("\nGroq API key is not configured.")
+    try:
+        import getpass
+        key = getpass.getpass("Enter your Groq API key (gsk_...): ").strip()
+    except Exception:
+        key = input("Enter your Groq API key (gsk_...): ").strip()
+
+    if not key:
+        raise ConfigError("API key cannot be empty.")
+
+    store.save_credentials({"groq_api_key": key})
+    print(f"✓ Saved Groq API key globally to {store.credentials_path}\n")
+    return key
 
 
 # --- Primitive helpers ------------------------------------------------------
@@ -186,8 +214,11 @@ def _as_str(value: object, default: str = "") -> str:
 class Settings:
     """Resolved NovaCLI configuration."""
 
+    provider: str
     groq_api_key: str | None
     groq_model: str
+    ollama_model: str
+    ollama_base_url: str
     project_root: Path
     command_timeout: int
 
@@ -199,6 +230,7 @@ class Settings:
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT
     api_key_source: str = "none"
+    web_token: str | None = None
     reasoning_effort: str | None = None
     extra_ignore: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
@@ -206,11 +238,22 @@ class Settings:
     # -- Derived state -----------------------------------------------------
 
     @property
+    def model(self) -> str:
+        """Return the active model name based on selected provider."""
+        if self.provider == "ollama":
+            return self.ollama_model
+        return self.groq_model
+
+    @property
     def has_api_key(self) -> bool:
+        if self.provider == "ollama":
+            return True
         return bool(self.groq_api_key)
 
     def require_api_key(self) -> str:
         """Return the API key or raise :class:`ConfigError` with setup steps."""
+        if self.provider == "ollama":
+            return ""
         if not self.groq_api_key:
             raise ConfigError(API_KEY_HINT)
         return self.groq_api_key
@@ -219,6 +262,10 @@ class Settings:
     def masked_api_key(self) -> str:
         return mask_secret(self.groq_api_key)
 
+    @property
+    def has_web_token(self) -> bool:
+        return bool(self.web_token)
+
     def with_overrides(self, **changes: object) -> "Settings":
         """Return a copy with the given fields replaced."""
         return replace(self, **changes)  # type: ignore[arg-type]
@@ -226,7 +273,11 @@ class Settings:
     def to_public_dict(self) -> dict[str, object]:
         """A browser/CLI-safe view. Contains no secret material."""
         return {
+            "provider": self.provider,
+            "model": self.model,
             "groq_model": self.groq_model,
+            "ollama_model": self.ollama_model,
+            "ollama_base_url": self.ollama_base_url,
             "project_root": str(self.project_root),
             "command_timeout": self.command_timeout,
             "max_steps": self.max_steps,
@@ -236,14 +287,14 @@ class Settings:
             "has_api_key": self.has_api_key,
             "api_key_preview": self.masked_api_key,
             "api_key_source": self.api_key_source,
+            "has_web_token": self.has_web_token,
             "reasoning_effort": self.reasoning_effort,
         }
 
     def __repr__(self) -> str:  # pragma: no cover
         """Redacted repr so tracebacks and logs never leak the key."""
         return (
-            f"Settings(groq_api_key={self.masked_api_key!r}, "
-            f"groq_model={self.groq_model!r}, "
+            f"Settings(provider={self.provider!r}, model={self.model!r}, "
             f"project_root={str(self.project_root)!r}, "
             f"command_timeout={self.command_timeout!r}, "
             f"safety_mode={self.safety_mode!r})"
@@ -301,6 +352,11 @@ def load_settings(
             return _as_str(from_creds)
         return _as_str(user_config.get(key) or user_config.get(key.lower())) or None
 
+    # -- Provider ----------------------------------------------------------
+    provider = (layered("NOVA_PROVIDER") or _as_str(user_config.get("provider")) or DEFAULT_PROVIDER).lower()
+    if provider not in VALID_PROVIDERS:
+        provider = DEFAULT_PROVIDER
+
     # -- API key -----------------------------------------------------------
     api_key = layered("GROQ_API_KEY")
     if environ.get("GROQ_API_KEY"):
@@ -314,8 +370,15 @@ def load_settings(
     else:
         key_source = "none"
 
+    web_token = layered("NOVA_WEB_TOKEN")
+
+    # -- Models & Ollama Endpoint ------------------------------------------
+    generic_model = layered("NOVA_MODEL")
+    groq_model = layered("GROQ_MODEL") or (generic_model if provider == "groq" else None) or DEFAULT_GROQ_MODEL
+    ollama_model = layered("OLLAMA_MODEL") or (generic_model if provider == "ollama" else None) or DEFAULT_OLLAMA_MODEL
+    ollama_base_url = layered("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL
+
     # -- Remaining values --------------------------------------------------
-    model = layered("GROQ_MODEL") or DEFAULT_MODEL
     timeout = _as_int(
         layered("NOVA_COMMAND_TIMEOUT") or DEFAULT_TIMEOUT,
         DEFAULT_TIMEOUT,
@@ -343,8 +406,11 @@ def load_settings(
         reasoning_effort = None
 
     settings = Settings(
+        provider=provider,
         groq_api_key=api_key,
-        groq_model=_as_str(model, DEFAULT_MODEL),
+        groq_model=_as_str(groq_model, DEFAULT_GROQ_MODEL),
+        ollama_model=_as_str(ollama_model, DEFAULT_OLLAMA_MODEL),
+        ollama_base_url=_as_str(ollama_base_url, DEFAULT_OLLAMA_BASE_URL),
         project_root=root,
         command_timeout=timeout,
         max_steps=max_steps,
@@ -366,6 +432,7 @@ def load_settings(
             )
         ),
         api_key_source=key_source,
+        web_token=web_token,
         reasoning_effort=reasoning_effort,
         environment=dict(environ),
     )
@@ -373,6 +440,6 @@ def load_settings(
     if overrides:
         settings = settings.with_overrides(**overrides)
 
-    if require_api_key:
+    if require_api_key and settings.provider == "groq":
         settings.require_api_key()
     return settings
