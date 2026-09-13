@@ -147,7 +147,7 @@ def test_build_messages_includes_system_context_and_task(make_agent) -> None:
     agent = make_agent(FakeProvider())
     messages, files = agent.build_messages("explain auth")
     assert messages[0].role == "system"
-    assert "read_file" in messages[0].content
+    assert "Nova" in messages[0].content
     assert messages[-1].role == "user"
     assert "explain auth" in messages[-1].content
 
@@ -179,7 +179,7 @@ async def test_final_answer_first_turn(make_agent) -> None:
 async def test_read_file_tool_is_executed(make_agent) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("read_file", path="main.py"),
+            FakeProvider.native_tool_call("read_file", path="main.py"),
             FakeProvider.final("It greets people."),
         ]
     )
@@ -195,18 +195,18 @@ async def test_read_file_tool_is_executed(make_agent) -> None:
 
 async def test_observation_is_fed_back_to_the_model(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("read_file", path="main.py"), FakeProvider.final("done")]
+        [FakeProvider.native_tool_call("read_file", path="main.py"), FakeProvider.final("done")]
     )
     agent = make_agent(provider)
     [event async for event in agent.stream("read main.py")]
 
     second_call = provider.calls[1]
-    assert any("Observation" in m["content"] for m in second_call)
+    assert any(m.get("role") == "tool" for m in second_call)
 
 
 async def test_unknown_tool_is_reported_to_the_model(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("teleport", path="x"), FakeProvider.final("gave up")]
+        [FakeProvider.native_tool_call("teleport", path="x"), FakeProvider.final("gave up")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("do something")]
@@ -219,7 +219,7 @@ async def test_unknown_tool_is_reported_to_the_model(make_agent) -> None:
 async def test_forbidden_action_is_blocked_without_running(make_agent, tmp_path: Path) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("run_command", command="rm -rf /"),
+            FakeProvider.native_tool_call("run_command", command="rm -rf /"),
             FakeProvider.final("understood"),
         ]
     )
@@ -233,7 +233,7 @@ async def test_forbidden_action_is_blocked_without_running(make_agent, tmp_path:
 
 async def test_reading_a_secret_file_is_blocked(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("read_file", path=".env"), FakeProvider.final("cannot")]
+        [FakeProvider.native_tool_call("read_file", path=".env"), FakeProvider.final("cannot")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("read the env")]
@@ -243,7 +243,7 @@ async def test_reading_a_secret_file_is_blocked(make_agent) -> None:
 async def test_write_file_creates_the_file_with_approval(make_agent, tmp_path: Path) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("write_file", path="created.py", content="x = 1\n"),
+            FakeProvider.native_tool_call("write_file", path="created.py", content="x = 1\n"),
             FakeProvider.final("written"),
         ]
     )
@@ -257,7 +257,7 @@ async def test_write_file_creates_the_file_with_approval(make_agent, tmp_path: P
 async def test_run_command_tool_executes(make_agent) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("run_command", command="echo from-tool"),
+            FakeProvider.native_tool_call("run_command", command="echo from-tool"),
             FakeProvider.final("ran it"),
         ]
     )
@@ -269,7 +269,7 @@ async def test_run_command_tool_executes(make_agent) -> None:
 
 async def test_project_summary_tool(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("project_summary"), FakeProvider.final("ok")]
+        [FakeProvider.native_tool_call("project_summary"), FakeProvider.final("ok")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("what is this?")]
@@ -279,7 +279,7 @@ async def test_project_summary_tool(make_agent) -> None:
 
 async def test_search_tool(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("search", query="def greet"), FakeProvider.final("ok")]
+        [FakeProvider.native_tool_call("search", query="def greet"), FakeProvider.final("ok")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("find greet")]
@@ -289,7 +289,7 @@ async def test_search_tool(make_agent) -> None:
 
 async def test_list_files_tool(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("list_files", path="."), FakeProvider.final("ok")]
+        [FakeProvider.native_tool_call("list_files", path="."), FakeProvider.final("ok")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("list files")]
@@ -298,7 +298,7 @@ async def test_list_files_tool(make_agent) -> None:
 
 
 async def test_max_steps_is_enforced(make_agent) -> None:
-    provider = FakeProvider([FakeProvider.action("list_files", path=".") for _ in range(10)])
+    provider = FakeProvider([FakeProvider.native_tool_call("list_files", path=".") for _ in range(10)])
     agent = make_agent(provider, max_steps=3)
     events = [event async for event in agent.stream("loop forever")]
 
@@ -326,7 +326,7 @@ async def test_unconfigured_provider_reports_setup_error(make_agent) -> None:
 
 
 async def test_malformed_json_is_retried(make_agent) -> None:
-    # Valid JSON, but it names neither a tool nor an answer.
+    # Valid JSON text, but it names neither a tool nor an answer.
     provider = FakeProvider(['{"thought": "hmm"}', FakeProvider.final("recovered")])
     agent = make_agent(provider)
     events = [event async for event in agent.stream("hi")]
@@ -379,7 +379,7 @@ async def test_run_returns_a_result(make_agent) -> None:
 
 async def test_run_records_steps(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("read_file", path="main.py"), FakeProvider.final("done")]
+        [FakeProvider.native_tool_call("read_file", path="main.py"), FakeProvider.final("done")]
     )
     agent = make_agent(provider)
     result = await agent.run("read it")
@@ -417,7 +417,7 @@ async def test_tool_output_is_redacted(make_agent, tmp_path: Path) -> None:
     (tmp_path / "leaky.py").write_text(f'KEY = "{secret}"\n', encoding="utf-8")
 
     provider = FakeProvider(
-        [FakeProvider.action("read_file", path="leaky.py"), FakeProvider.final("seen")]
+        [FakeProvider.native_tool_call("read_file", path="leaky.py"), FakeProvider.final("seen")]
     )
     agent = make_agent(provider)
     events = [event async for event in agent.stream("read leaky.py")]

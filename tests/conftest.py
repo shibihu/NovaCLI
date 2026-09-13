@@ -16,6 +16,7 @@ from nova.ai import AIProviderError
 from nova.config import load_settings
 from nova.core.agent import NovaAgent, ToolBox
 from nova.core.context import ContextBuilder
+from nova.core.models import AIResponse, ToolCall
 from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyPolicy
 from nova.workspace.files import Workspace
@@ -55,19 +56,42 @@ class FakeProvider:
         self.replies: list[Any] = list(replies or [])
         self.model_name = model
         self.configured = configured
-        self.calls: list[list[dict[str, str]]] = []
+        self.calls: list[list[dict[str, Any]]] = []
         self.closed = False
 
     async def complete(
-        self, messages: list[dict[str, str]], model: str | None = None
-    ) -> str:
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> AIResponse:
         self.calls.append(list(messages))
         if not self.replies:
             raise AIProviderError("FakeProvider ran out of scripted replies.")
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
-        return str(reply)
+
+        if isinstance(reply, AIResponse):
+            return reply
+
+        # String or legacy reply
+        if isinstance(reply, str):
+            # Check if it was constructed via FakeProvider.native_tool_call
+            try:
+                data = json.loads(reply)
+                if isinstance(data, dict) and "native_tool_calls" in data:
+                    tcs = [
+                        ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"])
+                        for tc in data["native_tool_calls"]
+                    ]
+                    return AIResponse(text=data.get("thought"), tool_calls=tcs)
+            except Exception:
+                pass
+            return AIResponse(text=reply)
+
+        return AIResponse(text=str(reply))
 
     async def aclose(self) -> None:
         self.closed = True
@@ -78,6 +102,15 @@ class FakeProvider:
         return json.dumps(
             {"thought": thought, "action": tool, "action_input": arguments}
         )
+
+    @staticmethod
+    def native_tool_call(tool: str, call_id: str = "call_1", thought: str | None = None, **arguments: Any) -> str:
+        return json.dumps({
+            "thought": thought,
+            "native_tool_calls": [
+                {"id": call_id, "name": tool, "arguments": arguments}
+            ]
+        })
 
     @staticmethod
     def final(answer: str, thought: str = "done") -> str:
@@ -132,13 +165,11 @@ def tmp_project(tmp_path: Path) -> Path:
     sub.mkdir()
     (sub / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
 
-    # Noise that the workspace must ignore.
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "junk.pyc").write_bytes(b"\x00\x01\x02")
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
 
-    # Secrets that must never be readable.
     (tmp_path / ".env").write_text("GROQ_API_KEY=gsk_real_secret_value_abcdefghijklmnop\n", encoding="utf-8")
 
     return tmp_path

@@ -20,9 +20,10 @@ SECRET = "gsk_thisisaverysecretkeyvalue_1234567890"
 # --- Fake SDK ---------------------------------------------------------------
 
 
-def make_response(content: str = "hello") -> Any:
+def make_response(content: str = "hello", tool_calls: list[Any] | None = None) -> Any:
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        choices=[SimpleNamespace(message=message)]
     )
 
 
@@ -105,7 +106,8 @@ def test_blank_key_is_treated_as_missing() -> None:
 async def test_complete_returns_text() -> None:
     client = FakeClient(make_response("the answer"))
     provider = GroqProvider(SECRET, client=client)
-    assert await provider.complete([{"role": "user", "content": "hi"}]) == "the answer"
+    res = await provider.complete([{"role": "user", "content": "hi"}])
+    assert res.text == "the answer"
 
 
 async def test_complete_passes_model_and_messages() -> None:
@@ -149,7 +151,31 @@ async def test_complete_rejects_empty_message_list(provider: GroqProvider) -> No
 
 async def test_complete_strips_whitespace() -> None:
     provider = GroqProvider(SECRET, client=FakeClient(make_response("  spaced  ")))
-    assert await provider.complete([{"role": "user", "content": "x"}]) == "spaced"
+    res = await provider.complete([{"role": "user", "content": "x"}])
+    assert res.text == "spaced"
+
+
+# --- Native Tools -----------------------------------------------------------
+
+
+async def test_complete_with_native_tools() -> None:
+    tool_call = SimpleNamespace(
+        id="call_123",
+        function=SimpleNamespace(name="read_file", arguments='{"path": "main.py"}')
+    )
+    response = make_response(content=None, tool_calls=[tool_call])
+    client = FakeClient(response)
+    provider = GroqProvider(SECRET, client=client)
+
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    res = await provider.complete([{"role": "user", "content": "read main.py"}], tools=tools)
+
+    assert res.has_tool_calls is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].id == "call_123"
+    assert res.tool_calls[0].name == "read_file"
+    assert res.tool_calls[0].arguments == {"path": "main.py"}
+    assert client.calls[0]["tool_choice"] == "auto"
 
 
 # --- Failure modes ----------------------------------------------------------
@@ -234,7 +260,8 @@ async def test_list_content_parts_are_joined() -> None:
     message = SimpleNamespace(content=[{"text": "part one "}, {"text": "part two"}])
     response = SimpleNamespace(choices=[SimpleNamespace(message=message)])
     provider = GroqProvider(SECRET, client=FakeClient(response))
-    assert await provider.complete([{"role": "user", "content": "hi"}]) == "part one part two"
+    res = await provider.complete([{"role": "user", "content": "hi"}])
+    assert res.text == "part one part two"
 
 
 async def test_errors_never_leak_the_key() -> None:
@@ -252,7 +279,7 @@ async def test_aclose_closes_an_owned_client() -> None:
     client = FakeClient()
     provider = GroqProvider(SECRET, client=client)
     await provider.aclose()
-    assert client.closed is False  # injected clients are not ours to close
+    assert client.closed is False
     assert provider._client is None
 
 
