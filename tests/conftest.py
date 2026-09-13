@@ -24,6 +24,14 @@ from nova.workspace.projects import ProjectAnalyzer
 TEST_API_KEY = "gsk_test0000000000000000000000000000000000"
 
 
+@pytest.fixture(autouse=True)
+def isolate_global_nova_dir(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Ensure host system's ~/.nova files do not contaminate tests."""
+    fake_nova_dir = tmp_path_factory.mktemp("fake_nova")
+    monkeypatch.setattr("nova.config.DEFAULT_USER_CONFIG_PATH", fake_nova_dir / "config.json")
+    monkeypatch.setattr("nova.config.DEFAULT_USER_CREDENTIALS_PATH", fake_nova_dir / "credentials.json")
+
+
 # ---------------------------------------------------------------------------
 # Fake provider
 # ---------------------------------------------------------------------------

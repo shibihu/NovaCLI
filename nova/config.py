@@ -4,7 +4,8 @@ Resolution order for the API key (highest priority first):
 
 1. ``GROQ_API_KEY`` environment variable
 2. ``.env`` file in the project root
-3. ``~/.nova/config.json`` (``{"groq_api_key": "gsk_..."}``)
+3. ``~/.nova/credentials.json`` (``{"groq_api_key": "gsk_..."}``)
+4. ``~/.nova/config.json`` (``{"groq_api_key": "gsk_..."}``)
 
 Secrets are never logged, never returned to the browser and never placed in
 the project context handed to the model. Every external representation of a
@@ -37,6 +38,7 @@ MAX_MAX_STEPS = 50
 
 ENV_FILE_NAME = ".env"
 DEFAULT_USER_CONFIG_PATH = Path.home() / ".nova" / "config.json"
+DEFAULT_USER_CREDENTIALS_PATH = Path.home() / ".nova" / "credentials.json"
 
 VALID_SAFETY_MODES = ("smart", "strict", "permissive")
 
@@ -48,11 +50,14 @@ NovaCLI needs a key to talk to the model. Set it in any ONE of these places
   1. Environment variable:
          export GROQ_API_KEY=gsk_your_key_here
 
-  2. A {ENV_FILE_NAME} file in your project root (recommended):
+  2. A {ENV_FILE_NAME} file in your project root:
          cp .env.example {ENV_FILE_NAME}
          # then edit {ENV_FILE_NAME} and set GROQ_API_KEY=gsk_...
 
-  3. The user-level config file ({DEFAULT_USER_CONFIG_PATH}):
+  3. Global credentials file ({DEFAULT_USER_CREDENTIALS_PATH}):
+         {{"groq_api_key": "gsk_your_key_here"}}
+
+  4. User-level config file ({DEFAULT_USER_CONFIG_PATH}):
          {{"groq_api_key": "gsk_your_key_here"}}
 
 Get a free key at https://console.groq.com/keys
@@ -63,16 +68,56 @@ class ConfigError(Exception):
     """Raised when NovaCLI cannot build a usable configuration."""
 
 
+# --- Credential & Config Store ---------------------------------------------
+
+
+class NovaConfigStore:
+    """Storage for user-level global configuration and credentials under ~/.nova/."""
+
+    def __init__(self, nova_dir: str | Path | None = None) -> None:
+        if nova_dir is None:
+            self.nova_dir = Path.home() / ".nova"
+        else:
+            self.nova_dir = Path(nova_dir).expanduser().resolve()
+
+    @property
+    def config_path(self) -> Path:
+        return self.nova_dir / "config.json"
+
+    @property
+    def credentials_path(self) -> Path:
+        return self.nova_dir / "credentials.json"
+
+    def load_config(self) -> dict[str, object]:
+        return read_user_config(self.config_path)
+
+    def save_config(self, data: dict[str, object]) -> None:
+        self.nova_dir.mkdir(parents=True, exist_ok=True)
+        self.config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def load_credentials(self) -> dict[str, object]:
+        return read_user_config(self.credentials_path)
+
+    def save_credentials(self, data: dict[str, object]) -> None:
+        self.nova_dir.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(data, indent=2)
+        if os.name == "posix":
+            fd = os.open(self.credentials_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                os.chmod(self.credentials_path, 0o600)
+            except OSError:
+                pass
+        else:
+            self.credentials_path.write_text(text, encoding="utf-8")
+
+
 # --- Primitive helpers ------------------------------------------------------
 
 
 def parse_dotenv(text: str) -> dict[str, str]:
-    """Parse ``.env`` text into a mapping.
-
-    Supports ``KEY=value``, ``export KEY=value``, ``#`` comments, blank lines,
-    and single/double quoted values. Deliberately tiny — no ``python-dotenv``
-    dependency, which keeps the Termux install surface small.
-    """
+    """Parse ``.env`` text into a mapping."""
     values: dict[str, str] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -102,7 +147,7 @@ def read_dotenv(path: Path) -> dict[str, str]:
 
 
 def read_user_config(path: Path) -> dict[str, object]:
-    """Read ``~/.nova/config.json``, tolerating a missing or corrupt file."""
+    """Read JSON config/credential file, tolerating a missing or corrupt file."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -111,10 +156,7 @@ def read_user_config(path: Path) -> dict[str, object]:
 
 
 def mask_secret(secret: str | None, *, keep: int = 4) -> str:
-    """Return a display-safe version of a secret, e.g. ``gsk_…a1b2``.
-
-    Never returns enough of the key to be usable.
-    """
+    """Return a display-safe version of a secret, e.g. ``gsk_…a1b2``."""
     if not secret:
         return ""
     if len(secret) <= keep:
@@ -142,12 +184,7 @@ def _as_str(value: object, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    """Resolved NovaCLI configuration.
-
-    Frozen so that a long-running session cannot have its workspace root or
-    timeout mutated underneath it; use :func:`dataclasses.replace` to derive a
-    variant.
-    """
+    """Resolved NovaCLI configuration."""
 
     groq_api_key: str | None
     groq_model: str
@@ -200,7 +237,7 @@ class Settings:
             "api_key_source": self.api_key_source,
         }
 
-    def __repr__(self) -> str:  # pragma: no cover - defensive, matches tests
+    def __repr__(self) -> str:  # pragma: no cover
         """Redacted repr so tracebacks and logs never leak the key."""
         return (
             f"Settings(groq_api_key={self.masked_api_key!r}, "
@@ -220,27 +257,17 @@ def load_settings(
     env: Mapping[str, str] | None = None,
     dotenv_path: str | Path | None = None,
     user_config_path: str | Path | None = None,
+    user_credentials_path: str | Path | None = None,
     require_api_key: bool = False,
     **overrides: object,
 ) -> Settings:
-    """Build :class:`Settings` using the documented priority order.
-
-    All inputs are injectable, which makes the loader fully testable without
-    touching the real environment or home directory.
-
-    Args:
-        project_root: Workspace root. Falls back to ``NOVA_PROJECT_ROOT`` and
-            then the current working directory.
-        env: Environment mapping. Defaults to :data:`os.environ`.
-        dotenv_path: Explicit ``.env`` path. Defaults to
-            ``<project_root>/.env``.
-        user_config_path: Explicit ``~/.nova/config.json`` path.
-        require_api_key: Raise immediately when no key is configured.
-        **overrides: Extra :class:`Settings` field overrides.
-    """
+    """Build :class:`Settings` using the documented priority order."""
     environ: Mapping[str, str] = os.environ if env is None else env
     user_config = read_user_config(
         Path(user_config_path) if user_config_path else DEFAULT_USER_CONFIG_PATH
+    )
+    user_credentials = read_user_config(
+        Path(user_credentials_path) if user_credentials_path else DEFAULT_USER_CREDENTIALS_PATH
     )
 
     # -- Workspace root ----------------------------------------------------
@@ -253,7 +280,7 @@ def load_settings(
     root = Path(raw_root).expanduser()
     try:
         root = root.resolve()
-    except OSError:  # pragma: no cover - resolve() rarely fails
+    except OSError:
         root = root.absolute()
 
     # -- .env layer --------------------------------------------------------
@@ -261,17 +288,15 @@ def load_settings(
     dotenv = read_dotenv(env_file)
 
     def layered(key: str) -> str | None:
-        """Environment variable > .env > user config.
-
-        ``.env`` and the environment use upper-case names; the JSON user
-        config conventionally uses lower-case ones (``{"groq_api_key": ...}``),
-        so both spellings are accepted for that last layer.
-        """
+        """Environment variable > .env > user credentials > user config."""
         from_env = environ.get(key)
         if from_env:
             return _as_str(from_env)
         if key in dotenv and dotenv[key]:
             return dotenv[key]
+        from_creds = user_credentials.get(key) or user_credentials.get(key.lower())
+        if from_creds:
+            return _as_str(from_creds)
         return _as_str(user_config.get(key) or user_config.get(key.lower())) or None
 
     # -- API key -----------------------------------------------------------
@@ -280,7 +305,9 @@ def load_settings(
         key_source = "environment"
     elif dotenv.get("GROQ_API_KEY"):
         key_source = ENV_FILE_NAME
-    elif user_config.get("groq_api_key"):
+    elif user_credentials.get("groq_api_key") or user_credentials.get("GROQ_API_KEY"):
+        key_source = "global-credentials"
+    elif user_config.get("groq_api_key") or user_config.get("GROQ_API_KEY"):
         key_source = "user-config"
     else:
         key_source = "none"
