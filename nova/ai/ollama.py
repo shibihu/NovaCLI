@@ -82,15 +82,32 @@ class OllamaProvider:
             if "content" in m and m["content"] is not None:
                 msg["content"] = str(m["content"])
             if "tool_calls" in m and m["tool_calls"] is not None:
-                msg["tool_calls"] = m["tool_calls"]
+                norm_tool_calls = []
+                for tc in m["tool_calls"]:
+                    tc_copy = dict(tc)
+                    if "function" in tc_copy and isinstance(tc_copy["function"], dict):
+                        func_copy = dict(tc_copy["function"])
+                        raw_args = func_copy.get("arguments")
+                        if isinstance(raw_args, str):
+                            try:
+                                func_copy["arguments"] = json.loads(raw_args)
+                            except Exception:
+                                pass
+                        tc_copy["function"] = func_copy
+                    norm_tool_calls.append(tc_copy)
+                msg["tool_calls"] = norm_tool_calls
             if "tool_call_id" in m and m["tool_call_id"] is not None:
                 msg["tool_call_id"] = str(m["tool_call_id"])
             if "name" in m and m["name"] is not None:
                 msg["name"] = str(m["name"])
+                msg["tool_name"] = str(m["name"])
             clean_messages.append(msg)
 
         if not any(m["role"] == "system" for m in clean_messages):
-            clean_messages.insert(0, {"role": "system", "content": "You are Nova, a coding agent."})
+            clean_messages.insert(0, {
+                "role": "system",
+                "content": "You are Nova, a coding agent with access to real workspace tools. Always use appropriate tools to inspect files or run commands before answering, and never fabricate tool output."
+            })
 
         target_model = model or self._model
         client = self._get_client()
