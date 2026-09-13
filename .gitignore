@@ -37,6 +37,7 @@ ENV/
 .coverage.*
 htmlcov/
 .tox/
+.pytest_cache
 
 # NovaCLI runtime artifacts
 .nova-cache/
