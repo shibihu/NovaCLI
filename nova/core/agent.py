@@ -44,10 +44,15 @@ from .safety import SafetyError, SafetyPolicy, SafetyVerdict
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are Nova, an autonomous coding agent working inside a developer's project.
+SYSTEM_PROMPT = """You are Nova, an autonomous coding agent working inside a developer's project with access to real workspace tools.
 
-You investigate the codebase using tools, then answer questions or modify files as required.
-Be precise, terse and honest: if you do not know something, say so.
+When the user asks you to inspect files, execute commands, read files, write files, search files, or perform another operation that an available tool can perform, use the appropriate tool.
+
+Never invent, guess, or fabricate file contents, command output, or tool results.
+Only report filesystem or command output returned by a real tool.
+
+Always respond in Thai unless the user explicitly requests English.
+Keep code, commands, filenames, API names, and technical identifiers unchanged.
 
 ## Rules
 
@@ -58,8 +63,7 @@ Be precise, terse and honest: if you do not know something, say so.
 5. Credential files (.env, keys, tokens, SSH keys) are unavailable. Do not attempt to read or create them.
 6. Some commands require user approval and will be refused if denied — adapt accordingly.
 7. Be concise in your final responses. Use short markdown formatting.
-8. If a tool fails repeatedly, stop and explain the blocker instead of looping.
-"""
+8. If a tool fails repeatedly, stop and explain the blocker instead of looping."""
 
 MAX_OBSERVATION_CHARS = 6_000
 MAX_HISTORY_MESSAGES = 20
@@ -891,6 +895,16 @@ class NovaAgent:
                     error=event.data.get("error"),
                     blocked=bool(event.data.get("blocked")),
                     duration_ms=int(event.data.get("duration_ms") or 0),
+                )
+            elif event.type == EventType.BLOCKED:
+                step = steps.setdefault(event.step, AgentStep(index=event.step))
+                step.action = str(event.data.get("tool", ""))
+                step.action_input = dict(event.data.get("input") or {})
+                step.result = ToolResult(
+                    name=step.action,
+                    ok=False,
+                    blocked=True,
+                    error=str(event.data.get("reason", "")),
                 )
             elif event.type == EventType.FINAL:
                 result.answer = str(event.data.get("answer", ""))

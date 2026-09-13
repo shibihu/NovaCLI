@@ -92,7 +92,7 @@ class CerebrasProvider:
             clean_messages.append(msg)
 
         if not any(m["role"] == "system" for m in clean_messages):
-            clean_messages.insert(0, {"role": "system", "content": "You are Nova, a coding agent."})
+            clean_messages.insert(0, {"role": "system", "content": "You are Nova, a coding agent with access to real workspace tools. Always use appropriate tools to inspect files or run commands before answering, and never fabricate tool output."})
 
         target_model = model or self._model
         client = self._get_client()
