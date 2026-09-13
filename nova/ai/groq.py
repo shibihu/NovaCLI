@@ -193,31 +193,39 @@ class GroqProvider:
                     func = tc.get("function")
 
                 name = ""
-                args: dict[str, Any] = {}
-                parse_error = False
+                raw_args_str = ""
+                parsed_args: dict[str, Any] | None = None
 
                 if func:
                     name = getattr(func, "name", None) or (func.get("name") if isinstance(func, dict) else "") or ""
                     raw_args = getattr(func, "arguments", None) if not isinstance(func, dict) else func.get("arguments")
 
                     if isinstance(raw_args, str):
+                        raw_args_str = raw_args
                         try:
-                            parsed_args = json.loads(raw_args)
-                            if isinstance(parsed_args, dict):
-                                args = parsed_args
+                            decoded = json.loads(raw_args)
+                            if isinstance(decoded, dict):
+                                parsed_args = decoded
                             else:
-                                args = {"_invalid_json": True, "raw": raw_args}
-                                parse_error = True
+                                parsed_args = None
                         except ValueError:
-                            args = {"_invalid_json": True, "raw": raw_args}
-                            parse_error = True
+                            parsed_args = None
                     elif isinstance(raw_args, dict):
-                        args = raw_args
+                        raw_args_str = json.dumps(raw_args)
+                        parsed_args = raw_args
                     elif raw_args is None:
-                        args = {}
+                        raw_args_str = "{}"
+                        parsed_args = {}
 
                 if name:
-                    parsed_tool_calls.append(ToolCall(id=str(call_id), name=str(name), arguments=args))
+                    parsed_tool_calls.append(
+                        ToolCall(
+                            id=str(call_id),
+                            name=str(name),
+                            arguments=parsed_args,
+                            raw_arguments=raw_args_str,
+                        )
+                    )
 
         content = getattr(message, "content", None)
         if isinstance(content, list):
