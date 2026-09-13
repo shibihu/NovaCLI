@@ -14,13 +14,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from nova.ai import AIProviderError, get_provider
-from nova.config import API_KEY_HINT, Settings
+from nova.config import API_KEY_HINT, NovaConfigStore, Settings
 from nova.core.agent import AgentController, build_agent
 from nova.core.models import ApprovalDecision, RiskLevel
 from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyError, SafetyPolicy
 from nova.workspace.files import Workspace, detect_language
 from nova.workspace.projects import ProjectAnalyzer
+from nova.intelligence.cache import IntelligenceCache
 from nova.web.app import TEMPLATES_DIR
 from nova.web.events import SessionRegistry, stream_session
 
@@ -150,8 +151,25 @@ async def config(request: Request) -> dict[str, Any]:
     return _settings(request).to_public_dict()
 
 
+@router.get("/api/config/status")
+async def config_status(request: Request) -> dict[str, Any]:
+    """Status of global config & credentials without exposing secrets."""
+    settings = _settings(request)
+    store = NovaConfigStore()
+    return {
+        "has_api_key": settings.has_api_key,
+        "api_key_source": settings.api_key_source,
+        "api_key_preview": settings.masked_api_key,
+        "global_config_path": str(store.config_path),
+        "global_config_exists": store.config_path.exists(),
+        "global_credentials_path": str(store.credentials_path),
+        "global_credentials_exists": store.credentials_path.exists(),
+        "model": settings.groq_model,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Project / files
+# Project / files / Intelligence
 # ---------------------------------------------------------------------------
 
 
@@ -167,6 +185,26 @@ async def project(request: Request) -> dict[str, Any]:
         "tree": workspace.tree(".", max_depth=3, max_entries=200),
         "skills": analyzer.detect_commands(),
     }
+
+
+@router.get("/api/project/intelligence")
+async def project_intelligence(request: Request) -> dict[str, Any]:
+    """Return Project Intelligence 2.0 info."""
+    settings = _settings(request)
+    workspace = _workspace(settings)
+    cache = IntelligenceCache(workspace)
+    info = cache.get_or_scan()
+    return info.to_dict()
+
+
+@router.post("/api/project/refresh")
+async def project_intelligence_refresh(request: Request) -> dict[str, Any]:
+    """Force re-scan Project Intelligence 2.0 info."""
+    settings = _settings(request)
+    workspace = _workspace(settings)
+    cache = IntelligenceCache(workspace)
+    info = cache.get_or_scan(force_refresh=True)
+    return info.to_dict()
 
 
 @router.get("/api/tree")
@@ -238,12 +276,7 @@ async def write_file(request: Request, body: WriteBody) -> dict[str, Any]:
 
 @router.post("/api/run")
 async def run_command(request: Request, body: RunBody) -> dict[str, Any]:
-    """Run a shell command through the safety layer and runner.
-
-    A command that needs approval but has not been approved returns
-    ``requires_approval: true`` with HTTP 200, so the UI can show its confirm
-    dialog and re-post with ``approve: true``. Refusals return HTTP 403.
-    """
+    """Run a shell command through the safety layer and runner."""
     settings = _settings(request)
     safety = _safety(settings)
     verdict = safety.check_command(body.command)
@@ -276,11 +309,7 @@ async def run_command(request: Request, body: RunBody) -> dict[str, Any]:
 
 
 def _agent_factory(settings: Settings):
-    """Build the factory the session registry calls to create an agent.
-
-    Construction is deferred so a missing dependency shows up as a streamed
-    error event rather than an import failure at request time.
-    """
+    """Build the factory the session registry calls to create an agent."""
 
     def factory():
         try:
@@ -299,7 +328,6 @@ async def start_agent(request: Request, body: AgentRequest) -> JSONResponse:
     registry = _registry(request)
 
     if not settings.has_api_key:
-        # Fail fast with setup instructions rather than a background error.
         raise HTTPException(status.HTTP_400_BAD_REQUEST, API_KEY_HINT)
 
     controller = AgentController(

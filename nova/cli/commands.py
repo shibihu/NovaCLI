@@ -25,7 +25,10 @@ from typing import Any, Sequence
 from nova import __version__
 from nova.config import (
     API_KEY_HINT,
+    DEFAULT_USER_CONFIG_PATH,
+    DEFAULT_USER_CREDENTIALS_PATH,
     ConfigError,
+    NovaConfigStore,
     Settings,
     load_settings,
 )
@@ -41,6 +44,7 @@ from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyError, SafetyPolicy
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
+from nova.intelligence.cache import IntelligenceCache
 
 # ---------------------------------------------------------------------------
 # Terminal styling
@@ -202,8 +206,6 @@ def _print_event(console: Console, event: Any, *, verbose: bool) -> None:
         decision = str(data.get("decision"))
         style = "green" if decision == "approve" else "yellow"
         console.write(f"    {console.paint('→', style)} {console.paint(decision, style)}")
-    # APPROVAL_REQUEST is handled by the approval handler itself.
-    # PROGRESS is intentionally silent in the CLI.
     elif kind == EventType.FINAL:
         console.write()
         console.rule("answer")
@@ -243,11 +245,6 @@ async def _run_streaming(
     history: Sequence[Message] | None = None,
     verbose: bool = False,
 ) -> tuple[str, list[Message], bool]:
-    """Drive the agent, printing events.
-
-    Returns ``(answer, updated_history, failed)`` so callers can map a failed
-    run onto a non-zero exit code.
-    """
     answer = ""
     failed = False
     async for event in agent.stream(task, history=history, controller=controller):
@@ -279,7 +276,6 @@ def cmd_ask(args: argparse.Namespace, console: Console) -> int:
 
     agent = None
     try:
-        # Fail fast with setup instructions instead of a streamed error.
         settings.require_api_key()
 
         controller = AgentController(
@@ -504,32 +500,101 @@ def cmd_summary(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
-def cmd_config(args: argparse.Namespace, console: Console) -> int:
+def cmd_project(args: argparse.Namespace, console: Console) -> int:
+    """Project Intelligence 2.0 CLI command."""
     settings = _settings_from_args(args)
-    data = settings.to_public_dict()
+    workspace = _make_workspace(settings)
+    cache = IntelligenceCache(workspace)
+
+    subcommand = getattr(args, "project_subcommand", None)
+    force_refresh = (subcommand == "scan")
+
+    info = cache.get_or_scan(force_refresh=force_refresh)
+
     if args.json:
-        console.write(json.dumps(data, indent=2))
+        console.write(json.dumps(info.to_dict(), indent=2))
         return 0
 
-    console.title("NovaCLI configuration")
+    console.title("◆ Nova Project Intelligence 2.0")
     console.write()
-    console.write(f"  model          {data['groq_model']}")
-    console.write(f"  project root   {data['project_root']}")
-    console.write(f"  timeout        {data['command_timeout']}s")
-    console.write(f"  max steps      {data['max_steps']}")
-    console.write(f"  safety mode    {data['safety_mode']}")
-    console.write(f"  web host       {data['host']}:{data['port']}")
+    console.write(f"  Name:             {info.name}")
+    console.write(f"  Root:             {info.root}")
+    console.write(f"  Ecosystems:       {', '.join(info.ecosystems) if info.ecosystems else 'None'}")
+    console.write(f"  Frameworks:       {', '.join(info.frameworks) if info.frameworks else 'None'}")
+    console.write(f"  Package Managers: {', '.join(info.package_managers) if info.package_managers else 'None'}")
+    console.write(f"  Files:            {info.total_files} ({info.total_bytes / 1024:.1f} KiB)")
+    if info.entry_points:
+        console.write(f"  Entry points:     {', '.join(ep.path for ep in info.entry_points[:5])}")
+    if info.tests.frameworks or info.tests.total_tests:
+        console.write(f"  Tests:            {info.tests.total_tests} files ({', '.join(info.tests.frameworks)})")
+    if info.git.has_git:
+        console.write(f"  Git Branch:       {info.git.branch or 'unknown'}")
+        console.write(f"  Git Modified:     {len(info.git.modified_files)} file(s)")
+        console.write(f"  Git Untracked:    {len(info.git.untracked_files)} file(s)")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace, console: Console) -> int:
+    store = NovaConfigStore()
+    subcommand = getattr(args, "config_subcommand", None)
+
+    if subcommand == "set-key":
+        key = getattr(args, "key", "").strip()
+        if not key:
+            console.error("API key cannot be empty.")
+            return 2
+        store.save_credentials({"groq_api_key": key})
+        console.ok(f"Saved global Groq API key to {store.credentials_path}")
+        return 0
+
+    settings = _settings_from_args(args)
+    data = settings.to_public_dict()
+
+    config_exists = store.config_path.exists()
+    creds_exists = store.credentials_path.exists()
+
+    if args.json:
+        output_data = dict(data)
+        output_data.update({
+            "global_config_path": str(store.config_path),
+            "global_config_exists": config_exists,
+            "global_credentials_path": str(store.credentials_path),
+            "global_credentials_exists": creds_exists,
+        })
+        console.write(json.dumps(output_data, indent=2))
+        return 0
+
+    console.title("◆ Nova Configuration")
+    console.write()
+    console.write(f"  Global config:")
+    console.write(f"    {store.config_path}  {'✓' if config_exists else '✗'}")
+    console.write()
+    console.write(f"  Credentials:")
+    console.write(f"    {store.credentials_path}  {'✓' if creds_exists else '✗'}")
+    console.write()
+    console.write(f"  Provider:")
+    console.write(f"    Groq")
+    console.write()
     if settings.has_api_key:
         source = f"(from {settings.api_key_source})"
+        console.write(f"  API key:")
         console.write(
-            f"  api key        {console.paint('configured', 'green')} "
+            f"    {console.paint('configured', 'green')} "
             f"{console.paint(settings.masked_api_key, 'dim')} "
             f"{console.paint(source, 'dim')}"
         )
     else:
-        console.write(f"  api key        {console.paint('missing', 'red')}")
+        console.write(f"  API key:")
+        console.write(f"    {console.paint('missing', 'red')}")
         console.write()
         console.write(console.paint(API_KEY_HINT, "dim"))
+    console.write()
+    console.write(f"  Model:")
+    console.write(f"    {data['groq_model']}")
+    console.write()
+    console.write(f"  Project root:  {data['project_root']}")
+    console.write(f"  Timeout:       {data['command_timeout']}s")
+    console.write(f"  Safety mode:   {data['safety_mode']}")
     return 0
 
 
@@ -564,7 +629,7 @@ def cmd_doctor(args: argparse.Namespace, console: Console) -> int:
     if settings.has_api_key:
         console.ok(f"API key configured (from {settings.api_key_source})")
     else:
-        console.warn("API key missing — set GROQ_API_KEY (see `.env.example`)")
+        console.warn("API key missing — set GROQ_API_KEY or use `nova config set-key`")
         failures += 1
 
     if settings.project_root.is_dir():
@@ -750,12 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.set_defaults(func=cmd_serve)
 
-    # `run` uses REMAINDER so flags belong to the executed command, not to
-    # NovaCLI: `nova run pytest -q` and `nova run rm -rf build` both work.
-    # NovaCLI's own options for this subcommand must therefore come first.
     p_run = add("run", "Run a shell command through the safety layer.")
-    # NOTE: dest must not be "command" — that is the subparser's own dest, and
-    # sharing it would overwrite the command name with the command list.
     p_run.add_argument(
         "shell_command",
         nargs=argparse.REMAINDER,
@@ -766,6 +826,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_summary = add("summary", "Show what NovaCLI understands about the project.")
     p_summary.set_defaults(func=cmd_summary)
+
+    p_project = add("project", "Project Intelligence 2.0 details.")
+    p_project_sub = p_project.add_subparsers(dest="project_subcommand")
+    p_project_info = p_project_sub.add_parser("info", parents=[common], help="Show project intelligence info.")
+    p_project_info.set_defaults(func=cmd_project)
+    p_project_scan = p_project_sub.add_parser("scan", parents=[common], help="Force refresh project scan.")
+    p_project_scan.set_defaults(func=cmd_project)
+    p_project.set_defaults(func=cmd_project)
 
     p_tree = add("tree", "Print a project tree.")
     p_tree.add_argument("path", nargs="?", default=".")
@@ -788,7 +856,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--regex", action="store_true", help="Treat the query as a regex")
     p_search.set_defaults(func=cmd_search)
 
-    p_config = add("config", "Show the effective configuration (secrets masked).")
+    p_config = add("config", "Show or manage the configuration and global credentials.")
+    config_sub = p_config.add_subparsers(dest="config_subcommand")
+    p_config_status = config_sub.add_parser("status", parents=[common], help="Show configuration status.")
+    p_config_status.set_defaults(func=cmd_config)
+    p_config_set = config_sub.add_parser("set-key", parents=[common], help="Set global Groq API key.")
+    p_config_set.add_argument("key", help="The Groq API key (e.g. gsk_...)")
+    p_config_set.set_defaults(func=cmd_config)
     p_config.set_defaults(func=cmd_config)
 
     p_doctor = add("doctor", "Diagnose Python, dependencies, API key and workspace.")
@@ -830,5 +904,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
-if __name__ == "__main__":  # pragma: no cover - module entry point
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

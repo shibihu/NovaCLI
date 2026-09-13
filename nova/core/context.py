@@ -1,15 +1,9 @@
 """Project understanding / prompt assembly.
 
 :class:`ContextBuilder` decides *what the model gets to see*. It assembles a
-compact brief — project shape, file tree, and the handful of files most likely
-relevant to the task — and redacts secrets on the way out.
-
-Hard guarantees:
-
-* The API key and any credential material are redacted before inclusion.
-* ``.env``-style files are never read (the :class:`Workspace` refuses them).
-* Total size is bounded so a large repo cannot blow past the context window or
-  a phone's memory.
+compact brief — project shape, file tree, Project Intelligence 2.0 context,
+and the handful of files most likely relevant to the task — and redacts secrets
+on the way out.
 """
 
 from __future__ import annotations
@@ -21,6 +15,8 @@ from typing import Any
 
 from nova.workspace.files import BINARY_EXTENSIONS, Workspace, detect_language
 from nova.workspace.projects import ProjectAnalyzer
+from nova.intelligence.cache import IntelligenceCache
+from nova.intelligence.models import ProjectInfo
 
 from .models import ProjectSummary
 from .safety import SafetyError, SafetyPolicy
@@ -60,6 +56,7 @@ class ContextBundle:
     text: str
     files: list[str] = field(default_factory=list)
     summary: ProjectSummary | None = None
+    intelligence: ProjectInfo | None = None
     truncated: bool = False
     estimated_tokens: int = 0
 
@@ -100,17 +97,12 @@ class ContextBuilder:
         self.max_scan_bytes = max_scan_bytes
         self.tree_depth = tree_depth
         self.tree_entries = tree_entries
+        self.intelligence_cache = IntelligenceCache(workspace)
 
     # -- Relevance ranking -----------------------------------------------
 
     def rank_files(self, task: str, *, limit: int | None = None) -> list[str]:
-        """Rank workspace files by relevance to ``task``.
-
-        Scoring favours filename hits over path hits over content hits, so a
-        file called ``auth.py`` beats one that merely mentions "auth". Content
-        is always scanned (bounded) because some tasks - "where is login
-        defined?" - can only be answered by looking inside the files.
-        """
+        """Rank workspace files by relevance to ``task``."""
         limit = limit if limit is not None else self.max_files
         task_keywords = keywords(task)
         if not task_keywords:
@@ -141,7 +133,6 @@ class ContextBuilder:
         return [path for path, _ in scored.most_common(limit)][:limit]
 
     def _content_hits(self, candidate: Any, task_keywords: set[str]) -> int:
-        """How many task keywords appear in a file's body (0 when unreadable)."""
         if candidate.suffix.lower() in BINARY_EXTENSIONS:
             return 0
         if candidate.suffix.lower() in {".json", ".lock", ".map"}:
@@ -156,7 +147,6 @@ class ContextBuilder:
         return sum(1 for keyword in task_keywords if keyword in lowered)
 
     def _fallback_files(self, limit: int) -> list[str]:
-        """When no keywords match, lead with entry points and tests."""
         summary = self.analyzer.summarize()
         ordered = list(summary.entry_points) + list(summary.key_files)
         return ordered[:limit]
@@ -166,6 +156,14 @@ class ContextBuilder:
     def build(self, task: str = "", *, extra_files: list[str] | None = None) -> ContextBundle:
         """Assemble the full project brief."""
         summary = self.analyzer.summarize()
+
+        # Try fetching Project Intelligence 2.0 safely
+        intel: ProjectInfo | None = None
+        try:
+            intel = self.intelligence_cache.get_or_scan()
+        except Exception:
+            intel = None
+
         chosen: list[str] = []
 
         for path in (extra_files or []):
@@ -179,7 +177,22 @@ class ContextBuilder:
         truncated = False
         sections: list[str] = []
 
-        # 1. Project shape -------------------------------------------------
+        # 1. Project Intelligence Section ---------------------------------
+        if intel:
+            intel_lines = [
+                "PROJECT INTELLIGENCE 2.0",
+                f"Ecosystems: {', '.join(intel.ecosystems) if intel.ecosystems else 'Unknown'}",
+                f"Frameworks: {', '.join(intel.frameworks) if intel.frameworks else 'None detected'}",
+                f"Package managers: {', '.join(intel.package_managers) if intel.package_managers else 'None'}",
+                f"Entry points: {', '.join(e.path for e in intel.entry_points[:5]) if intel.entry_points else 'None'}",
+                f"Tests: {intel.tests.total_tests} files ({', '.join(intel.tests.frameworks) if intel.tests.frameworks else 'framework unknown'})",
+            ]
+            if intel.git.has_git:
+                git_desc = f"Branch: {intel.git.branch or 'unknown'} | Modified: {len(intel.git.modified_files)} | Untracked: {len(intel.git.untracked_files)}"
+                intel_lines.append(f"Git state: {git_desc}")
+            sections.append("\n".join(intel_lines))
+
+        # 2. Project shape -------------------------------------------------
         languages = ", ".join(
             f"{name} ({count})" for name, count in list(summary.languages.items())[:6]
         ) or "unknown"
@@ -198,22 +211,20 @@ class ContextBuilder:
                 "Likely commands: "
                 + "; ".join(f"{key}={value}" for key, value in summary.commands.items())
             )
-        if summary.tests:
-            head.append(f"Test files: {len(summary.tests)} (e.g. {', '.join(summary.tests[:3])})")
         sections.append("\n".join(head))
 
-        # 2. Structure -----------------------------------------------------
+        # 3. Structure -----------------------------------------------------
         try:
             tree = self.workspace.tree(".", max_depth=self.tree_depth, max_entries=self.tree_entries)
         except (OSError, ValueError):
             tree = "(unavailable)"
         sections.append("# Structure\n```\n" + tree + "\n```")
 
-        # 3. README --------------------------------------------------------
+        # 4. README --------------------------------------------------------
         if summary.readme:
             sections.append("# README (excerpt)\n" + summary.readme[:1_200])
 
-        # 4. Relevant files ------------------------------------------------
+        # 5. Relevant files ------------------------------------------------
         file_blocks: list[str] = []
         for relative in chosen:
             block = self._render_file(relative)
@@ -239,17 +250,15 @@ class ContextBuilder:
             text=text,
             files=chosen,
             summary=summary,
+            intelligence=intel,
             truncated=truncated,
             estimated_tokens=max(1, len(text) // 4),
         )
 
     def _render_file(self, relative: str) -> str:
-        """Render one file as a fenced block, or a note if unavailable."""
         language = detect_language(relative) or ""
         fence = language.lower().replace(" ", "") if language else "text"
         try:
-            # head_text, not read_text: a big generated file should still
-            # contribute its opening lines instead of being dropped entirely.
             content = self.workspace.head_text(
                 relative, max_bytes=self.max_chars_per_file * 4
             )
@@ -260,14 +269,10 @@ class ContextBuilder:
             content = content[: self.max_chars_per_file].rstrip() + "\n... [truncated]"
         return f"### {relative}\n```{fence}\n{content}\n```"
 
-    # -- Convenience -----------------------------------------------------
-
     def summarize_text(self) -> str:
-        """The rendered project summary, for ``nova summary``."""
         return self.analyzer.render_summary()
 
     def language_breakdown(self) -> dict[str, str]:
-        """Map detected language -> ``"<count> files"`` for UI display."""
         return {
             name: f"{count} file{'s' if count != 1 else ''}"
             for name, count in self.analyzer.detect_languages().items()
