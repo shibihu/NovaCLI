@@ -214,7 +214,7 @@ async def test_cancelled_controller_denies_immediately() -> None:
 
 
 async def test_cancel_before_the_first_step(make_agent) -> None:
-    provider = FakeProvider([FakeProvider.action("list_files", path=".")])
+    provider = FakeProvider([FakeProvider.native_tool_call("list_files", path=".")])
     agent = make_agent(provider)
     controller = AgentController()
     controller.cancel()
@@ -225,7 +225,7 @@ async def test_cancel_before_the_first_step(make_agent) -> None:
 
 
 async def test_cancel_mid_run(make_agent) -> None:
-    provider = FakeProvider([FakeProvider.action("list_files", path=".") for _ in range(8)])
+    provider = FakeProvider([FakeProvider.native_tool_call("list_files", path=".") for _ in range(8)])
     agent = make_agent(provider)
     controller = AgentController()
 
@@ -240,7 +240,7 @@ async def test_cancel_mid_run(make_agent) -> None:
 
 
 async def test_cancel_produces_a_cancelled_result(make_agent) -> None:
-    provider = FakeProvider([FakeProvider.action("list_files", path=".") for _ in range(8)])
+    provider = FakeProvider([FakeProvider.native_tool_call("list_files", path=".") for _ in range(8)])
     agent = make_agent(provider)
     controller = AgentController()
     controller.cancel()
@@ -269,7 +269,7 @@ async def _run_with_approval(make_agent, provider, controller, agent_kwargs=None
 async def test_write_requires_and_receives_approval(make_agent, tmp_project: Path) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("write_file", path="approved.py", content="ok = True\n"),
+            FakeProvider.native_tool_call("write_file", path="approved.py", content="ok = True\n"),
             FakeProvider.final("done"),
         ]
     )
@@ -293,7 +293,7 @@ async def test_write_requires_and_receives_approval(make_agent, tmp_project: Pat
 async def test_denied_write_is_not_performed(make_agent, tmp_project: Path) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("write_file", path="denied.py", content="x = 1\n"),
+            FakeProvider.native_tool_call("write_file", path="denied.py", content="x = 1\n"),
             FakeProvider.final("understood, not writing"),
         ]
     )
@@ -315,7 +315,7 @@ async def test_denied_write_is_not_performed(make_agent, tmp_project: Path) -> N
 async def test_denied_action_tells_the_model_not_to_retry(make_agent) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("write_file", path="a.py", content="1\n"),
+            FakeProvider.native_tool_call("write_file", path="a.py", content="1\n"),
             FakeProvider.final("stopping"),
         ]
     )
@@ -329,14 +329,14 @@ async def test_denied_action_tells_the_model_not_to_retry(make_agent) -> None:
     controller.resolve(controller.pending_request_id, ApprovalDecision.DENY)
     await asyncio.wait_for(task, timeout=10)
 
-    follow_up = " ".join(message["content"] for message in provider.calls[-1])
-    assert "DENIED" in follow_up
+    tool_msg = [m for m in provider.calls[-1] if m.get("role") == "tool"][0]
+    assert "DENIED" in tool_msg["content"]
 
 
 async def test_approval_timeout_denies_and_continues(make_agent, tmp_project: Path) -> None:
     provider = FakeProvider(
         [
-            FakeProvider.action("write_file", path="timedout.py", content="1\n"),
+            FakeProvider.native_tool_call("write_file", path="timedout.py", content="1\n"),
             FakeProvider.final("moved on"),
         ]
     )
@@ -350,7 +350,7 @@ async def test_approval_timeout_denies_and_continues(make_agent, tmp_project: Pa
 
 async def test_safe_tools_never_prompt(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("read_file", path="main.py"), FakeProvider.final("done")]
+        [FakeProvider.native_tool_call("read_file", path="main.py"), FakeProvider.final("done")]
     )
     controller = AgentController(approval_timeout=0.2)
     agent = make_agent(provider)
@@ -362,7 +362,7 @@ async def test_safe_tools_never_prompt(make_agent) -> None:
 
 async def test_forbidden_actions_bypass_the_approval_prompt(make_agent) -> None:
     provider = FakeProvider(
-        [FakeProvider.action("run_command", command="rm -rf /"), FakeProvider.final("ok")]
+        [FakeProvider.native_tool_call("run_command", command="rm -rf /"), FakeProvider.final("ok")]
     )
     controller = AgentController(approval_timeout=0.2)
     agent = make_agent(provider)

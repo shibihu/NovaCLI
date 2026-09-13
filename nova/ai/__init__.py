@@ -3,13 +3,15 @@
 Nova Core never talks to a vendor SDK directly — it talks to the
 :class:`AIProvider` protocol. Groq is the v1.0 implementation
 (:mod:`nova.ai.groq`); Gemini, OpenAI or a local model can be added later by
-implementing the same four members and registering them in
+implementing the same members and registering them in
 :func:`get_provider`.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+from nova.core.models import AIResponse
 
 __all__ = [
     "AIProvider",
@@ -30,12 +32,7 @@ class MissingAPIKeyError(AIProviderError):
 
 @runtime_checkable
 class AIProvider(Protocol):
-    """Minimal contract every model backend must satisfy.
-
-    Deliberately narrow: one async method returning text. Everything the agent
-    needs (tool use, planning, final answers) is expressed in the prompt and
-    parsed out of that text, so adding a backend requires no agent changes.
-    """
+    """Minimal contract every model backend must satisfy."""
 
     @property
     def model_name(self) -> str:
@@ -48,9 +45,13 @@ class AIProvider(Protocol):
         ...
 
     async def complete(
-        self, messages: list[dict[str, str]], model: str | None = None
-    ) -> str:
-        """Return the assistant's reply for ``messages``."""
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> AIResponse:
+        """Return the assistant's response (text and/or native tool calls)."""
         ...
 
     async def aclose(self) -> None:
@@ -64,10 +65,7 @@ def provider_names() -> tuple[str, ...]:
 
 
 def get_provider(settings: object, name: str = "groq") -> AIProvider:
-    """Build the configured provider.
-
-    Imported lazily so that ``import nova`` never pulls in a vendor SDK.
-    """
+    """Build the configured provider."""
     if name == "groq":
         from .groq import GroqProvider
 

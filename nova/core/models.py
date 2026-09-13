@@ -97,6 +97,33 @@ TERMINAL_EVENTS: frozenset[str] = frozenset(
 )
 
 
+# --- Tool plumbing ----------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """A tool invocation requested by the model."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return as_dict(self)
+
+
+@dataclass
+class AIResponse:
+    """Structured response returned by an AI provider."""
+
+    text: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+
 # --- Messages ---------------------------------------------------------------
 
 
@@ -105,36 +132,40 @@ class Message:
     """A single chat turn in the provider-agnostic OpenAI-style shape."""
 
     role: str
-    content: str
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"role": self.role}
+        if self.content is not None:
+            data["content"] = self.content
+        if self.tool_calls is not None:
+            data["tool_calls"] = self.tool_calls
+        if self.tool_call_id is not None:
+            data["tool_call_id"] = self.tool_call_id
+        if self.name is not None:
+            data["name"] = self.name
+        return data
 
     @classmethod
     def system(cls, content: str) -> "Message":
-        return cls("system", content)
+        return cls("system", content=content)
 
     @classmethod
     def user(cls, content: str) -> "Message":
-        return cls("user", content)
+        return cls("user", content=content)
 
     @classmethod
-    def assistant(cls, content: str) -> "Message":
-        return cls("assistant", content)
+    def assistant(
+        cls, content: str | None = None, tool_calls: list[dict[str, Any]] | None = None
+    ) -> "Message":
+        return cls("assistant", content=content, tool_calls=tool_calls)
 
-
-# --- Tool plumbing ----------------------------------------------------------
-
-
-@dataclass
-class ToolCall:
-    """A tool invocation requested by the model."""
-
-    name: str
-    arguments: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return as_dict(self)
+    @classmethod
+    def tool_result(cls, tool_call_id: str, name: str, content: str) -> "Message":
+        return cls("tool", content=content, tool_call_id=tool_call_id, name=name)
 
 
 @dataclass
@@ -147,6 +178,7 @@ class ToolResult:
     error: str | None = None
     blocked: bool = False
     duration_ms: int = 0
+    tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return as_dict(self)

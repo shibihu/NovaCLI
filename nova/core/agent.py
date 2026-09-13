@@ -5,14 +5,7 @@ web IDE both drive :class:`NovaAgent`; they differ only in how they render the
 :class:`~nova.core.models.AgentEvent` stream and how they answer approval
 requests.
 
-The model speaks a strict JSON protocol (below) rather than vendor tool-calling
-APIs, which keeps nova.ai.groq interchangeable with any future provider that
-can return text.
-
-Protocol, one object per turn::
-
-    {"thought": "...", "action": "read_file", "action_input": {"path": "a.py"}}
-    {"thought": "...", "final_answer": "..."}
+Supports both native Groq/OpenAI tool calling and text JSON protocol fallback.
 """
 
 from __future__ import annotations
@@ -53,39 +46,19 @@ from .safety import SafetyError, SafetyPolicy, SafetyVerdict
 
 SYSTEM_PROMPT = """You are Nova, an autonomous coding agent working inside a developer's project.
 
-You investigate the codebase with tools, then answer or change things. You are
-precise, terse and honest: if you do not know something, you say so.
-
-## Tools
-
-- `read_file`   {"path": "relative/path.py"}          Read a text file.
-- `write_file`  {"path": "relative/path.py", "content": "..."}  Create or overwrite a file.
-- `list_files`  {"path": ".", "depth": 2}             List a directory.
-- `search`      {"query": "text", "glob": "**/*.py"}  Search file contents.
-- `run_command` {"command": "pytest -q"}              Run a shell command in the project root.
-- `project_summary` {}                                Project languages, entry points, commands.
-
-## Response format
-
-Reply with EXACTLY ONE JSON object and nothing else — no markdown fence, no prose.
-
-To use a tool:
-{"thought": "why you are doing this", "action": "read_file", "action_input": {"path": "nova/config.py"}}
-
-To finish:
-{"thought": "why you are done", "final_answer": "your answer to the user"}
+You investigate the codebase using tools, then answer questions or modify files as required.
+Be precise, terse and honest: if you do not know something, say so.
 
 ## Rules
 
-1. One action per turn. Wait for the observation before the next step.
+1. Inspect before you modify. Read files before editing them. Never invent file contents.
 2. Paths are always relative to the project root.
-3. Read a file before you modify it. Never invent file contents.
-4. Prefer `search` and `list_files` over guessing paths.
-5. After a change, verify it: run the project's tests or the code you touched.
-6. Credential files (.env, keys, tokens) are unavailable. Do not try to read them.
-7. Some commands require user approval and will be refused silently if denied — adapt.
-8. Be concise in `final_answer`. Use short markdown; the user may be on a phone.
-9. If a tool fails repeatedly, stop and explain the blocker instead of looping.
+3. Prefer searching or listing directory contents over guessing paths.
+4. After making changes, verify them when possible (run tests or review the code).
+5. Credential files (.env, keys, tokens, SSH keys) are unavailable. Do not attempt to read or create them.
+6. Some commands require user approval and will be refused if denied — adapt accordingly.
+7. Be concise in your final responses. Use short markdown formatting.
+8. If a tool fails repeatedly, stop and explain the blocker instead of looping.
 """
 
 MAX_OBSERVATION_CHARS = 6_000
@@ -93,7 +66,7 @@ MAX_HISTORY_MESSAGES = 20
 
 
 # ---------------------------------------------------------------------------
-# Response parsing
+# Response parsing (for text JSON fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -126,11 +99,7 @@ _THOUGHT_KEYS = ("thought", "reasoning", "thinking", "plan")
 
 
 def extract_json_object(text: str) -> str | None:
-    """Return the first balanced ``{...}`` object in ``text``, or ``None``.
-
-    Brace counting is string- and escape-aware, so JSON containing ``{`` inside
-    a string literal does not terminate the scan early.
-    """
+    """Return the first balanced ``{...}`` object in ``text``, or ``None``."""
     if not text:
         return None
     start = text.find("{")
@@ -169,12 +138,7 @@ def _first_present(payload: dict[str, Any], keys: Sequence[str]) -> tuple[str, A
 
 
 def parse_agent_response(text: str) -> AgentDecision:
-    """Parse a model reply into an :class:`AgentDecision`.
-
-    Lenient by design: small models on a phone often wrap JSON in prose or a
-    markdown fence. A reply with no usable JSON is treated as a final answer
-    rather than an error, so a run never dies on a formatting slip.
-    """
+    """Parse a text model reply into an :class:`AgentDecision`."""
     raw = (text or "").strip()
     if not raw:
         return AgentDecision(raw=text, parse_error="empty response")
@@ -192,7 +156,6 @@ def parse_agent_response(text: str) -> AgentDecision:
             payload = None
 
     if payload is None:
-        # No JSON at all — treat the whole reply as the answer.
         return AgentDecision(final=raw, raw=text, thought="")
 
     _, final_value = _first_present(payload, _FINAL_KEYS)
@@ -203,7 +166,6 @@ def parse_agent_response(text: str) -> AgentDecision:
     thought = str(thought_value).strip() if isinstance(thought_value, (str, int, float)) else ""
     action_input = input_value if isinstance(input_value, dict) else {}
 
-    # A bare action string may carry its argument, e.g. {"action": "ls -la"}.
     action: str | None = None
     if isinstance(action_value, str) and action_value.strip():
         action = action_value.strip()
@@ -226,8 +188,6 @@ def parse_agent_response(text: str) -> AgentDecision:
             thought=thought, action=action, action_input=action_input, raw=text
         )
 
-    # Valid JSON, but it named neither an action nor an answer: the model
-    # needs another turn rather than being taken at its word.
     return AgentDecision(
         thought=thought,
         raw=text,
@@ -246,7 +206,7 @@ class ToolSpec:
 
     name: str
     description: str
-    parameters: str = ""
+    parameters: dict[str, Any]
 
 
 @dataclass
@@ -258,7 +218,7 @@ class ToolOutcome:
     blocked: bool = False
     error: str | None = None
 
-    def to_tool_result(self, name: str, duration_ms: int = 0) -> ToolResult:
+    def to_tool_result(self, name: str, duration_ms: int = 0, tool_call_id: str | None = None) -> ToolResult:
         return ToolResult(
             name=name,
             ok=self.ok,
@@ -266,24 +226,93 @@ class ToolOutcome:
             error=self.error,
             blocked=self.blocked,
             duration_ms=duration_ms,
+            tool_call_id=tool_call_id,
         )
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec("read_file", "Read a UTF-8 text file from the project.", '{"path": "..."}'),
-    ToolSpec("write_file", "Create or overwrite a project file.", '{"path": "...", "content": "..."}'),
-    ToolSpec("list_files", "List a directory in the project.", '{"path": ".", "depth": 2}'),
-    ToolSpec("search", "Search file contents.", '{"query": "...", "glob": "**/*.py"}'),
-    ToolSpec("run_command", "Run a shell command in the project root.", '{"command": "..."}'),
-    ToolSpec("project_summary", "Describe the project: languages, entry points, commands.", "{}"),
+    ToolSpec(
+        "read_file",
+        "Read a UTF-8 text file from the project.",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Relative file path to read"}},
+            "required": ["path"],
+        },
+    ),
+    ToolSpec(
+        "write_file",
+        "Create or overwrite a project file.",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative file path to write"},
+                "content": {"type": "string", "description": "Text content to write"},
+            },
+            "required": ["path", "content"],
+        },
+    ),
+    ToolSpec(
+        "list_files",
+        "List a directory in the project.",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative directory path (default '.')"},
+                "depth": {"type": "integer", "description": "Recursion depth (default 1)"},
+            },
+            "required": [],
+        },
+    ),
+    ToolSpec(
+        "search",
+        "Search file contents.",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Text or regex query to search"},
+                "glob": {"type": "string", "description": "Glob pattern (e.g. '**/*.py')"},
+            },
+            "required": ["query"],
+        },
+    ),
+    ToolSpec(
+        "run_command",
+        "Run a shell command in the project root.",
+        {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+            "required": ["command"],
+        },
+    ),
+    ToolSpec(
+        "project_summary",
+        "Describe the project: languages, entry points, commands.",
+        {"type": "object", "properties": {}, "required": []},
+    ),
 )
 
 TOOL_NAMES: frozenset[str] = frozenset(spec.name for spec in TOOL_SPECS)
 
 
 def render_tool_catalog() -> str:
-    """Tool list rendered for the system prompt."""
-    return "\n".join(f"- {s.name}{(' ' + s.parameters) if s.parameters else ''}: {s.description}" for s in TOOL_SPECS)
+    """Tool list rendered for legacy text fallback."""
+    return "\n".join(f"- {s.name}: {s.description}" for s in TOOL_SPECS)
+
+
+def get_native_tools_schema() -> list[dict[str, Any]]:
+    """Convert TOOL_SPECS into native OpenAI/Groq tool schema format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            },
+        }
+        for spec in TOOL_SPECS
+    ]
 
 
 class ToolBox:
@@ -318,7 +347,7 @@ class ToolBox:
             )
         try:
             handler = getattr(self, f"_tool_{name}")
-        except AttributeError:  # pragma: no cover - spec/handler drift guard
+        except AttributeError:
             return ToolOutcome(ok=False, error=f"Tool {name!r} is not implemented.")
 
         try:
@@ -332,7 +361,7 @@ class ToolBox:
             return ToolOutcome(ok=False, error=f"{type(exc).__name__}: {exc}")
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - a tool must never kill a run
+        except Exception as exc:
             return ToolOutcome(ok=False, error=f"{type(exc).__name__}: {exc}")
 
     # -- Handlers --------------------------------------------------------
@@ -413,12 +442,7 @@ ApprovalHandler = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 
 
 class AgentController:
-    """Pause, resume, cancel and approve an in-flight agent run.
-
-    The CLI supplies an :class:`ApprovalHandler` that prompts on stdin. The web
-    IDE leaves the handler unset and resolves approvals out-of-band through
-    :meth:`resolve`, which is what makes the approval modal work over HTTP.
-    """
+    """Pause, resume, cancel and approve an in-flight agent run."""
 
     def __init__(
         self,
@@ -434,35 +458,25 @@ class AgentController:
         self._always_allow: set[str] = set()
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
 
-    # -- Cancellation ----------------------------------------------------
-
     @property
     def cancelled(self) -> bool:
         return self._cancelled
 
     def cancel(self) -> None:
-        """Request cancellation; the loop stops at the next checkpoint."""
         self._cancelled = True
         for future in list(self._pending.values()):
             if not future.done():
                 future.set_result(ApprovalDecision.DENY)
         self._pending.clear()
 
-    # -- Approvals -------------------------------------------------------
-
     @property
     def pending_request_id(self) -> str | None:
-        """Id of the approval currently being awaited, if any."""
         for request_id, future in self._pending.items():
             if not future.done():
                 return request_id
         return None
 
     def resolve(self, request_id: str, decision: ApprovalDecision | str) -> bool:
-        """Answer a pending approval from outside the loop.
-
-        Returns ``True`` when a waiting request was satisfied.
-        """
         try:
             resolved = ApprovalDecision(decision)
         except ValueError:
@@ -474,7 +488,6 @@ class AgentController:
         return True
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
-        """Ask for a decision, honouring ``always`` and timeouts."""
         if self.auto_approve or request.tool in self._always_allow:
             return ApprovalDecision.APPROVE
         if self._cancelled:
@@ -488,7 +501,7 @@ class AgentController:
                 decision = ApprovalDecision.DENY
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a broken handler must not hang a run
+            except Exception:
                 decision = ApprovalDecision.DENY
         else:
             loop = asyncio.get_running_loop()
@@ -497,7 +510,6 @@ class AgentController:
             try:
                 decision = await asyncio.wait_for(future, timeout=self.approval_timeout)
             except asyncio.TimeoutError:
-                # Nobody answered in time: fail closed.
                 decision = ApprovalDecision.DENY
             except asyncio.CancelledError:
                 self._pending.pop(request.id, None)
@@ -564,27 +576,20 @@ class NovaAgent:
         self.max_steps = max_steps or self.settings.max_steps
         self.system_prompt = system_prompt or SYSTEM_PROMPT
 
-    # -- Prompt assembly -------------------------------------------------
-
     def system_message(self) -> Message:
-        return Message.system(
-            f"{self.system_prompt}\n\n## Available tools\n\n{render_tool_catalog()}"
-        )
+        return Message.system(self.system_prompt)
 
     def build_messages(
         self, task: str, history: Sequence[Message] | None = None
     ) -> tuple[list[Message], list[str]]:
-        """Assemble the initial message list and return the chosen files."""
         context = self.context_builder.build(task)
         messages: list[Message] = [self.system_message()]
         if history:
             messages.extend(list(history)[-MAX_HISTORY_MESSAGES:])
         messages.append(
-            Message.user(f"{context.text}\n\n# Task\n{task}\n\nRespond with ONE JSON object.")
+            Message.user(f"{context.text}\n\n# Task\n{task}")
         )
         return messages, context.files
-
-    # -- Run (streaming) -------------------------------------------------
 
     async def stream(
         self,
@@ -594,11 +599,6 @@ class NovaAgent:
         controller: AgentController | None = None,
         max_steps: int | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """Run the agent, yielding progress events as they happen.
-
-        The final event is always one of ``final``, ``error`` or ``cancelled``,
-        so a consumer never has to guess whether the run ended.
-        """
         controller = controller or AgentController()
         limit = max_steps or self.max_steps
 
@@ -629,6 +629,7 @@ class NovaAgent:
             yield AgentEvent(EventType.PROGRESS, {"files": files, "percent": 5})
 
         steps: list[AgentStep] = []
+        tools_schema = get_native_tools_schema()
 
         for index in range(1, limit + 1):
             if controller.cancelled:
@@ -643,8 +644,10 @@ class NovaAgent:
             )
 
             try:
-                reply = await self.provider.complete(
-                    [message.to_dict() for message in messages]
+                ai_response = await self.provider.complete(
+                    [m.to_dict() for m in messages],
+                    tools=tools_schema,
+                    tool_choice="auto",
                 )
             except AIProviderError as exc:
                 yield AgentEvent(EventType.ERROR, {"message": str(exc)}, step=index)
@@ -653,154 +656,173 @@ class NovaAgent:
                 yield AgentEvent(EventType.CANCELLED, {"steps": len(steps)}, step=index)
                 return
 
-            decision = parse_agent_response(reply)
+            # Native tool calling path
+            if ai_response.has_tool_calls:
+                assistant_tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                    }
+                    for tc in ai_response.tool_calls
+                ]
+                messages.append(Message.assistant(content=ai_response.text or "", tool_calls=assistant_tool_calls))
+
+                for tc in ai_response.tool_calls:
+                    action = tc.name
+                    arguments = tc.arguments
+                    tool_call_id = tc.id
+
+                    yield AgentEvent(
+                        EventType.TOOL_CALL,
+                        {"tool": action, "input": arguments},
+                        step=index,
+                    )
+
+                    # Safety check
+                    verdict: SafetyVerdict | None = None
+                    if action in TOOL_NAMES:
+                        verdict = self.safety.check_tool_call(action, arguments)
+                        if verdict.level == RiskLevel.FORBIDDEN or (
+                            not verdict.allowed and not verdict.requires_approval
+                        ):
+                            reason = verdict.reason or "blocked by safety policy"
+                            yield AgentEvent(
+                                EventType.BLOCKED,
+                                {"tool": action, "reason": reason, "input": arguments},
+                                step=index,
+                            )
+                            result = ToolResult(
+                                name=action, ok=False, blocked=True, error=reason, tool_call_id=tool_call_id
+                            )
+                            steps.append(
+                                AgentStep(
+                                    index=index, thought="", action=action,
+                                    action_input=arguments, result=result,
+                                )
+                            )
+                            obs = f"REFUSED by safety layer: {reason}"
+                            messages.append(Message.tool_result(tool_call_id, action, obs))
+                            continue
+
+                        if verdict.requires_approval and not controller.auto_approve:
+                            request = ApprovalRequest(
+                                id=uuid.uuid4().hex[:12],
+                                tool=action,
+                                summary=self._approval_summary(action, arguments),
+                                detail=self._approval_detail(action, arguments),
+                                level=verdict.level,
+                                reason=verdict.reason,
+                            )
+                            yield AgentEvent(EventType.APPROVAL_REQUEST, request.to_dict(), step=index)
+                            decision_ = await controller.request_approval(request)
+                            if controller.cancelled:
+                                yield AgentEvent(EventType.CANCELLED, {"steps": len(steps)}, step=index)
+                                return
+                            yield AgentEvent(
+                                EventType.APPROVAL_RESOLVED,
+                                {"id": request.id, "decision": str(decision_), "tool": action},
+                                step=index,
+                            )
+                            if decision_ == ApprovalDecision.DENY:
+                                reason = f"denied by user ({verdict.reason})"
+                                yield AgentEvent(EventType.BLOCKED, {"tool": action, "reason": "denied by user"}, step=index)
+                                result = ToolResult(
+                                    name=action, ok=False, blocked=True, error=reason, tool_call_id=tool_call_id
+                                )
+                                steps.append(
+                                    AgentStep(
+                                        index=index, thought="", action=action,
+                                        action_input=arguments, result=result,
+                                    )
+                                )
+                                messages.append(Message.tool_result(tool_call_id, action, f"DENIED: {reason}"))
+                                continue
+
+                    # Execute tool
+                    started = asyncio.get_running_loop().time()
+                    outcome = await self.toolbox.execute(action, arguments)
+                    duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+                    result = outcome.to_tool_result(action, duration_ms, tool_call_id=tool_call_id)
+                    result.output = self.safety.redact(result.output)
+                    if result.error:
+                        result.error = self.safety.redact(result.error)
+
+                    steps.append(
+                        AgentStep(
+                            index=index, thought="", action=action,
+                            action_input=arguments, result=result,
+                        )
+                    )
+                    yield AgentEvent(EventType.TOOL_RESULT, result.to_dict(), step=index)
+
+                    obs = result.render(limit=MAX_OBSERVATION_CHARS)
+                    messages.append(Message.tool_result(tool_call_id, action, obs))
+
+                continue
+
+            # Fallback or final answer text
+            reply_text = ai_response.text or ""
+            decision = parse_agent_response(reply_text)
 
             if decision.thought:
                 yield AgentEvent(EventType.THOUGHT, {"text": decision.thought}, step=index)
 
-            # -- Final answer -------------------------------------------
             if decision.is_final:
                 steps.append(AgentStep(index=index, thought=decision.thought, final_answer=decision.final))
-                yield AgentEvent(
-                    EventType.PROGRESS, {"percent": 100}, step=index
-                )
+                yield AgentEvent(EventType.PROGRESS, {"percent": 100}, step=index)
                 yield AgentEvent(
                     EventType.FINAL,
-                    {
-                        "answer": decision.final,
-                        "steps": len(steps),
-                        "files": files,
-                    },
+                    {"answer": decision.final, "steps": len(steps), "files": files},
                     step=index,
                 )
                 return
 
-            # -- Malformed turn -----------------------------------------
-            if not decision.is_action:
-                steps.append(AgentStep(index=index, thought=decision.thought))
-                yield AgentEvent(
-                    EventType.THOUGHT,
-                    {"text": "(retrying: reply was not a usable action or answer)"},
-                    step=index,
-                )
-                messages.append(Message.assistant(reply))
-                messages.append(
-                    Message.user(
-                        f"Your last reply was unusable ({decision.parse_error}). "
-                        "Reply with exactly ONE JSON object containing either "
-                        '"action" + "action_input" or "final_answer".'
-                    )
-                )
-                continue
+            if decision.is_action:
+                # Model returned text JSON instead of native tool calls
+                action = decision.action or ""
+                arguments = dict(decision.action_input)
+                yield AgentEvent(EventType.TOOL_CALL, {"tool": action, "input": arguments}, step=index)
 
-            action = decision.action or ""
-            arguments = dict(decision.action_input)
-            yield AgentEvent(
-                EventType.TOOL_CALL,
-                {"tool": action, "input": arguments},
-                step=index,
-            )
-
-            # -- Safety gate -------------------------------------------
-            verdict: SafetyVerdict | None = None
-            if action in TOOL_NAMES:
-                verdict = self.safety.check_tool_call(action, arguments)
-                if verdict.level == RiskLevel.FORBIDDEN or (
-                    not verdict.allowed and not verdict.requires_approval
-                ):
-                    reason = verdict.reason or "blocked by safety policy"
-                    yield AgentEvent(
-                        EventType.BLOCKED,
-                        {"tool": action, "reason": reason, "input": arguments},
-                        step=index,
-                    )
-                    observation = (
-                        f"REFUSED by the safety layer: {reason}. "
-                        "Do not retry this action; try a different approach."
-                    )
-                    result = ToolResult(name=action, ok=False, blocked=True, error=reason)
-                    steps.append(
-                        AgentStep(
-                            index=index, thought=decision.thought, action=action,
-                            action_input=arguments, result=result,
-                        )
-                    )
-                    messages.append(Message.assistant(reply))
-                    messages.append(Message.user(f"Observation:\n{observation}"))
-                    continue
-
-                if verdict.requires_approval and not controller.auto_approve:
-                    request = ApprovalRequest(
-                        id=uuid.uuid4().hex[:12],
-                        tool=action,
-                        summary=self._approval_summary(action, arguments),
-                        detail=self._approval_detail(action, arguments),
-                        level=verdict.level,
-                        reason=verdict.reason,
-                    )
-                    yield AgentEvent(
-                        EventType.APPROVAL_REQUEST, request.to_dict(), step=index
-                    )
-                    decision_ = await controller.request_approval(request)
-                    if controller.cancelled:
-                        yield AgentEvent(
-                            EventType.CANCELLED, {"steps": len(steps)}, step=index
-                        )
-                        return
-                    yield AgentEvent(
-                        EventType.APPROVAL_RESOLVED,
-                        {"id": request.id, "decision": str(decision_), "tool": action},
-                        step=index,
-                    )
-                    if decision_ == ApprovalDecision.DENY:
-                        observation = (
-                            f"The user DENIED permission to run {action}. "
-                            "Do not retry it; choose another approach or explain the blocker."
-                        )
-                        result = ToolResult(
-                            name=action, ok=False, blocked=True,
-                            error=f"denied by user ({verdict.reason})",
-                        )
-                        yield AgentEvent(
-                            EventType.BLOCKED,
-                            {"tool": action, "reason": "denied by user"},
-                            step=index,
-                        )
-                        steps.append(
-                            AgentStep(
-                                index=index, thought=decision.thought, action=action,
-                                action_input=arguments, result=result,
-                            )
-                        )
-                        messages.append(Message.assistant(reply))
-                        messages.append(Message.user(f"Observation:\n{observation}"))
+                verdict: SafetyVerdict | None = None
+                if action in TOOL_NAMES:
+                    verdict = self.safety.check_tool_call(action, arguments)
+                    if verdict.level == RiskLevel.FORBIDDEN or (
+                        not verdict.allowed and not verdict.requires_approval
+                    ):
+                        reason = verdict.reason or "blocked by safety policy"
+                        yield AgentEvent(EventType.BLOCKED, {"tool": action, "reason": reason, "input": arguments}, step=index)
+                        result = ToolResult(name=action, ok=False, blocked=True, error=reason)
+                        steps.append(AgentStep(index=index, thought=decision.thought, action=action, action_input=arguments, result=result))
+                        messages.append(Message.assistant(reply_text))
+                        messages.append(Message.user(f"Observation:\nREFUSED: {reason}"))
                         continue
 
-            # -- Execute ------------------------------------------------
-            started = asyncio.get_running_loop().time()
-            outcome = await self.toolbox.execute(action, arguments)
-            duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-            result = outcome.to_tool_result(action, duration_ms)
-            result.output = self.safety.redact(result.output)
-            if result.error:
-                result.error = self.safety.redact(result.error)
+                started = asyncio.get_running_loop().time()
+                outcome = await self.toolbox.execute(action, arguments)
+                duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+                result = outcome.to_tool_result(action, duration_ms)
+                result.output = self.safety.redact(result.output)
+                if result.error:
+                    result.error = self.safety.redact(result.error)
 
-            steps.append(
-                AgentStep(
-                    index=index, thought=decision.thought, action=action,
-                    action_input=arguments, result=result,
+                steps.append(AgentStep(index=index, thought=decision.thought, action=action, action_input=arguments, result=result))
+                yield AgentEvent(EventType.TOOL_RESULT, result.to_dict(), step=index)
+                obs = result.render(limit=MAX_OBSERVATION_CHARS)
+                messages.append(Message.assistant(reply_text))
+                messages.append(Message.user(f"Observation ({action}):\n{obs}"))
+                continue
+
+            # Unusable response
+            steps.append(AgentStep(index=index, thought=decision.thought))
+            messages.append(Message.assistant(reply_text))
+            messages.append(
+                Message.user(
+                    "Your last response was unusable. Please perform a tool call or give a final answer."
                 )
             )
-            yield AgentEvent(EventType.TOOL_RESULT, result.to_dict(), step=index)
 
-            observation = result.render(limit=MAX_OBSERVATION_CHARS)
-            messages.append(Message.assistant(reply))
-            messages.append(Message.user(f"Observation ({action}):\n{observation}"))
-
-        # -- Step budget exhausted --------------------------------------
-        best = next(
-            (s.final_answer for s in reversed(steps) if s.final_answer), None
-        )
+        best = next((s.final_answer for s in reversed(steps) if s.final_answer), None)
         answer = best or (
             f"Stopped after the maximum of {limit} steps without a final answer.\n\n"
             + self._progress_digest(steps)
@@ -811,8 +833,6 @@ class NovaAgent:
             step=limit,
         )
 
-    # -- Run (collecting) ------------------------------------------------
-
     async def run(
         self,
         task: str,
@@ -821,11 +841,6 @@ class NovaAgent:
         controller: AgentController | None = None,
         max_steps: int | None = None,
     ) -> AgentResult:
-        """Run to completion and return an :class:`AgentResult`.
-
-        A thin collector over :meth:`stream` — it records steps and terminal
-        state, but rendering stays the caller's job.
-        """
         result = AgentResult(
             task=task, model=self.provider.model_name, status=AgentStatus.RUNNING
         )
@@ -870,10 +885,7 @@ class NovaAgent:
         return result
 
     def run_sync(self, task: str, **kwargs: Any) -> AgentResult:
-        """Blocking convenience wrapper (used by the CLI)."""
         return asyncio.run(self.run(task, **kwargs))
-
-    # -- Helpers ---------------------------------------------------------
 
     def _approval_summary(self, action: str, arguments: dict[str, Any]) -> str:
         if action == "run_command":
@@ -913,7 +925,6 @@ def build_agent(
     provider: AIProvider | None = None,
     **kwargs: Any,
 ) -> NovaAgent:
-    """Construct a fully wired agent — the shared factory for CLI and web."""
     settings = settings or load_settings()
     if provider is None:
         from nova.ai import get_provider
@@ -934,6 +945,7 @@ __all__ = [
     "ToolSpec",
     "build_agent",
     "extract_json_object",
+    "get_native_tools_schema",
     "parse_agent_response",
     "render_tool_catalog",
 ]

@@ -43,6 +43,7 @@ can never drift apart.
 - [Quick start](#quick-start)
 - [Configuration & Global Credentials](#configuration)
 - [Project Intelligence 2.0](#project-intelligence-20)
+- [Native Tool Calling](#native-tool-calling)
 - [CLI reference](#cli-reference)
 - [Web IDE](#web-ide)
 - [Safety — Smart Mode](#safety--smart-mode)
@@ -59,7 +60,8 @@ can never drift apart.
 
 | Goal | How NovaCLI delivers it |
 |---|---|
-| **AI coding agent** | A reasoning loop that plans, calls tools, observes results and reports every step. |
+| **AI coding agent** | A reasoning loop that plans, executes native tool calls, observes results and reports every step. |
+| **Native Tool Calling** | Full native Groq/OpenAI tool-calling support (`openai/gpt-oss-20b`, `llama-3.3-70b-versatile`) with structured schema definitions, eliminating text JSON parsing issues. |
 | **Global Credentials** | API keys are stored globally in `~/.nova/credentials.json` and persist regardless of changing directories (`cwd`). |
 | **Project Intelligence 2.0** | Ecosystem detection (Python, Node.js, Luau/Roblox, Godot, Web), entry points, dependencies, test frameworks, Git state, and safe caching without rescan loops. |
 | **Mobile-first Web IDE** | Four tabs — Chat, Files, Terminal, Project — with 44px touch targets, safe-area insets and a dark theme. No build step. |
@@ -172,15 +174,30 @@ nova doctor
 | `safety_mode` | `NOVA_SAFETY_MODE` | `smart` | `smart` \| `strict` \| `permissive` |
 | `host` / `port` | `NOVA_HOST` / `NOVA_PORT` | `127.0.0.1` / `8000` | Web IDE bind address |
 
-### Secret handling
+---
 
-NovaCLI guarantees, and the test suite asserts, that the API key:
+## Native Tool Calling
 
-- is **never** sent to the browser (`/api/config/status` returns only `has_api_key` and a masked preview),
-- is **never** printed in logs, errors or tracebacks (`Settings.__repr__` is redacted; provider errors are sanitised),
-- is **never** placed in the project context or Project Intelligence cache sent to the model,
-- is **removed from the environment** of every child process it spawns,
-- is **redacted** from all tool output alongside generic patterns for Groq, OpenAI, Anthropic, Google, GitHub, Slack and AWS keys, PEM private keys, `Bearer` tokens and `key=value` credentials.
+NovaCLI supports native Groq/OpenAI tool calling. Rather than forcing models to generate raw text JSON, NovaCLI formats tools using standard JSON schema definitions and passes them via `tools` with `tool_choice="auto"`.
+
+```
+    Model (e.g. gpt-oss-20b, llama-3.3-70b)
+                      │
+           native tool call (id & args)
+                      │
+                      ▼
+               Nova ToolBox
+                      │
+           Safety & execution result
+                      │
+                      ▼
+            tool result message (id)
+                      │
+                      ▼
+            Model → final answer
+```
+
+This ensures reliable execution with models such as `openai/gpt-oss-20b` while retaining backward-compatible text parsing as a fallback.
 
 ---
 
@@ -280,7 +297,7 @@ override it.
 python -m pytest -q
 ```
 
-Full unit, integration, and regression test suite covering global credential resolution, Project Intelligence 2.0, workspace safety, agent controls, and Web API.
+Full unit, integration, and regression test suite covering native tool calling, global credential resolution, Project Intelligence 2.0, workspace safety, agent controls, and Web API.
 
 ---
 
