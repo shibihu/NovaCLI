@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from nova.ai import AIProviderError, get_provider
-from nova.config import API_KEY_HINT, NovaConfigStore, Settings
+from nova.config import get_api_key_hint, NovaConfigStore, Settings
 from nova.core.agent import AgentController, build_agent
 from nova.core.models import ApprovalDecision, RiskLevel
 from nova.core.runner import CommandRunner
@@ -85,7 +85,7 @@ def _safety(settings: Settings) -> SafetyPolicy:
     return SafetyPolicy(
         settings.project_root,
         settings.safety_mode,
-        secret_values=[settings.groq_api_key],
+        secret_values=settings.active_secrets,
     )
 
 
@@ -118,7 +118,7 @@ async def index(request: Request) -> HTMLResponse:
         "index.html",
         {
             "version": request.app.state.version,
-            "model": settings.groq_model,
+            "model": settings.model,
             "has_api_key": settings.has_api_key,
             "project_name": settings.project_root.name,
             "safety_mode": settings.safety_mode,
@@ -138,7 +138,7 @@ async def health(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "version": request.app.state.version,
-        "model": settings.groq_model,
+        "model": settings.model,
         "has_api_key": settings.has_api_key,
         "project_root": str(settings.project_root),
         "safety_mode": settings.safety_mode,
@@ -164,7 +164,7 @@ async def config_status(request: Request) -> dict[str, Any]:
         "global_config_exists": store.config_path.exists(),
         "global_credentials_path": str(store.credentials_path),
         "global_credentials_exists": store.credentials_path.exists(),
-        "model": settings.groq_model,
+        "model": settings.model,
     }
 
 
@@ -328,12 +328,12 @@ async def start_agent(request: Request, body: AgentRequest) -> JSONResponse:
     registry = _registry(request)
 
     if not settings.has_api_key:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, API_KEY_HINT)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, get_api_key_hint(settings.provider))
 
     controller = AgentController(
         auto_approve=body.auto_approve, approval_timeout=settings.approval_timeout
     )
-    session = registry.create(body.task, controller=controller, model=settings.groq_model)
+    session = registry.create(body.task, controller=controller, model=settings.model)
     registry.start(session, _agent_factory(settings))
 
     return JSONResponse(

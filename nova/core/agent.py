@@ -554,7 +554,7 @@ class NovaAgent:
         self.safety = safety or SafetyPolicy(
             root,
             self.settings.safety_mode,
-            secret_values=[self.settings.groq_api_key],
+            secret_values=self.settings.active_secrets,
         )
         self.workspace = workspace or Workspace(
             root, safety=self.safety, extra_ignore=self.settings.extra_ignore
@@ -614,9 +614,9 @@ class NovaAgent:
         )
 
         if not getattr(self.provider, "configured", True):
-            from nova.config import API_KEY_HINT
+            from nova.config import get_api_key_hint
 
-            yield AgentEvent(EventType.ERROR, {"message": API_KEY_HINT})
+            yield AgentEvent(EventType.ERROR, {"message": get_api_key_hint(self.settings.provider)})
             return
 
         try:

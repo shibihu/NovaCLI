@@ -3,7 +3,7 @@
 Resolution order for configuration and credentials (highest priority first):
 
 1. Explicit CLI arguments / overrides
-2. Environment variables (NOVA_PROVIDER, NOVA_MODEL, OLLAMA_BASE_URL, GROQ_API_KEY, GROQ_MODEL)
+2. Environment variables (NOVA_PROVIDER, NOVA_MODEL, GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY, OLLAMA_BASE_URL)
 3. Project .env file
 4. Global user credentials (~/.nova/credentials.json)
 5. Global user config (~/.nova/config.json)
@@ -19,12 +19,17 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
+from nova.ai import normalize_provider_name, provider_names
+
 # --- Defaults ---------------------------------------------------------------
 
 DEFAULT_PROVIDER = "groq"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-20b"
+DEFAULT_CEREBRAS_MODEL = "llama3.1-8b"
 
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_STEPS = 8
@@ -43,28 +48,45 @@ DEFAULT_USER_CONFIG_PATH = Path.home() / ".nova" / "config.json"
 DEFAULT_USER_CREDENTIALS_PATH = Path.home() / ".nova" / "credentials.json"
 
 VALID_SAFETY_MODES = ("smart", "strict", "permissive")
-VALID_PROVIDERS = ("groq", "ollama")
+VALID_PROVIDERS = provider_names()
 
-API_KEY_HINT = f"""No Groq API key configured.
 
-NovaCLI needs a key to talk to Groq. Set it in any ONE of these places
+def get_api_key_hint(provider: str) -> str:
+    prov = normalize_provider_name(provider)
+    if prov == "ollama":
+        return "Ollama does not require an API key. Ensure Ollama server is running at your configured base URL."
+
+    names = {
+        "groq": ("Groq", "GROQ_API_KEY", "gsk_your_key_here", "https://console.groq.com/keys"),
+        "gemini": ("Gemini", "GEMINI_API_KEY", "your_gemini_api_key", "https://aistudio.google.com/app/apikey"),
+        "openrouter": ("OpenRouter", "OPENROUTER_API_KEY", "sk-or-v1-your_key", "https://openrouter.ai/keys"),
+        "cerebras": ("Cerebras", "CEREBRAS_API_KEY", "csk-your_key", "https://cloud.cerebras.ai"),
+    }
+    display_name, env_var, example, url = names.get(prov, ("Groq", "GROQ_API_KEY", "gsk_your_key_here", "https://console.groq.com/keys"))
+
+    return f"""No {display_name} API key configured.
+
+NovaCLI needs a key to talk to {display_name}. Set it in any ONE of these places
 (highest priority first):
 
   1. Environment variable:
-         export GROQ_API_KEY=gsk_your_key_here
+         export {env_var}={example}
 
   2. A {ENV_FILE_NAME} file in your project root:
          cp .env.example {ENV_FILE_NAME}
-         # then edit {ENV_FILE_NAME} and set GROQ_API_KEY=gsk_...
+         # then edit {ENV_FILE_NAME} and set {env_var}={example}
 
   3. Global credentials file ({DEFAULT_USER_CREDENTIALS_PATH}):
-         {{"groq_api_key": "gsk_your_key_here"}}
+         {{"{env_var.lower()}": "{example}"}}
 
   4. User-level config file ({DEFAULT_USER_CONFIG_PATH}):
-         {{"groq_api_key": "gsk_your_key_here"}}
+         {{"{env_var.lower()}": "{example}"}}
 
-Get a free key at https://console.groq.com/keys
+Get a key at {url}
 """
+
+
+API_KEY_HINT = get_api_key_hint("groq")
 
 
 class ConfigError(Exception):
@@ -120,24 +142,32 @@ class NovaConfigStore:
             self.credentials_path.write_text(text, encoding="utf-8")
 
 
-def prompt_and_save_api_key(store: NovaConfigStore | None = None) -> str:
-    """Prompt the user for a missing Groq API key interactively in TTY and save it globally."""
+def prompt_and_save_api_key(store: NovaConfigStore | None = None, provider: str = "groq") -> str:
+    """Prompt the user for a missing provider API key interactively in TTY and save it globally."""
     store = store or NovaConfigStore()
-    if not sys.stdin.isatty():
-        raise ConfigError(API_KEY_HINT)
+    prov = normalize_provider_name(provider)
+    if prov == "ollama":
+        print("Ollama does not require an API key.")
+        return ""
 
-    print("\nGroq API key is not configured.")
+    hint = get_api_key_hint(prov)
+    if not sys.stdin.isatty():
+        raise ConfigError(hint)
+
+    key_field = f"{prov}_api_key"
+    disp_name = prov.capitalize()
+    print(f"\n{disp_name} API key is not configured.")
     try:
         import getpass
-        key = getpass.getpass("Enter your Groq API key (gsk_...): ").strip()
+        key = getpass.getpass(f"Enter your {disp_name} API key: ").strip()
     except Exception:
-        key = input("Enter your Groq API key (gsk_...): ").strip()
+        key = input(f"Enter your {disp_name} API key: ").strip()
 
     if not key:
         raise ConfigError("API key cannot be empty.")
 
-    store.save_credentials({"groq_api_key": key})
-    print(f"✓ Saved Groq API key globally to {store.credentials_path}\n")
+    store.save_credentials({key_field: key})
+    print(f"✓ Saved {disp_name} API key globally to {store.credentials_path}\n")
     return key
 
 
@@ -217,8 +247,14 @@ class Settings:
     provider: str
     groq_api_key: str | None
     groq_model: str
+    gemini_api_key: str | None
+    gemini_model: str
     ollama_model: str
     ollama_base_url: str
+    openrouter_api_key: str | None
+    openrouter_model: str
+    cerebras_api_key: str | None
+    cerebras_model: str
     project_root: Path
     command_timeout: int
 
@@ -238,29 +274,60 @@ class Settings:
     # -- Derived state -----------------------------------------------------
 
     @property
+    def active_api_key(self) -> str | None:
+        prov = normalize_provider_name(self.provider)
+        if prov == "groq":
+            return self.groq_api_key
+        if prov == "gemini":
+            return self.gemini_api_key
+        if prov == "openrouter":
+            return self.openrouter_api_key
+        if prov == "cerebras":
+            return self.cerebras_api_key
+        return None
+
+    @property
+    def active_secrets(self) -> list[str]:
+        keys = [self.groq_api_key, self.gemini_api_key, self.openrouter_api_key, self.cerebras_api_key, self.web_token]
+        return [k for k in keys if k]
+
+    @property
     def model(self) -> str:
         """Return the active model name based on selected provider."""
-        if self.provider == "ollama":
+        prov = normalize_provider_name(self.provider)
+        if prov == "ollama":
             return self.ollama_model
+        if prov == "gemini":
+            return self.gemini_model
+        if prov == "openrouter":
+            return self.openrouter_model
+        if prov == "cerebras":
+            return self.cerebras_model
         return self.groq_model
 
     @property
     def has_api_key(self) -> bool:
-        if self.provider == "ollama":
+        prov = normalize_provider_name(self.provider)
+        if prov == "ollama":
             return True
-        return bool(self.groq_api_key)
+        return bool(self.active_api_key)
 
     def require_api_key(self) -> str:
-        """Return the API key or raise :class:`ConfigError` with setup steps."""
-        if self.provider == "ollama":
+        """Return the active API key or raise :class:`ConfigError` with setup steps."""
+        prov = normalize_provider_name(self.provider)
+        if prov == "ollama":
             return ""
-        if not self.groq_api_key:
-            raise ConfigError(API_KEY_HINT)
-        return self.groq_api_key
+        key = self.active_api_key
+        if not key:
+            raise ConfigError(get_api_key_hint(prov))
+        return key
 
     @property
     def masked_api_key(self) -> str:
-        return mask_secret(self.groq_api_key)
+        prov = normalize_provider_name(self.provider)
+        if prov == "ollama":
+            return "not required"
+        return mask_secret(self.active_api_key)
 
     @property
     def has_web_token(self) -> bool:
@@ -276,8 +343,11 @@ class Settings:
             "provider": self.provider,
             "model": self.model,
             "groq_model": self.groq_model,
+            "gemini_model": self.gemini_model,
             "ollama_model": self.ollama_model,
             "ollama_base_url": self.ollama_base_url,
+            "openrouter_model": self.openrouter_model,
+            "cerebras_model": self.cerebras_model,
             "project_root": str(self.project_root),
             "command_timeout": self.command_timeout,
             "max_steps": self.max_steps,
@@ -353,29 +423,47 @@ def load_settings(
         return _as_str(user_config.get(key) or user_config.get(key.lower())) or None
 
     # -- Provider ----------------------------------------------------------
-    provider = (layered("NOVA_PROVIDER") or _as_str(user_config.get("provider")) or DEFAULT_PROVIDER).lower()
+    raw_prov = layered("NOVA_PROVIDER") or _as_str(user_config.get("provider")) or DEFAULT_PROVIDER
+    provider = normalize_provider_name(raw_prov)
     if provider not in VALID_PROVIDERS:
         provider = DEFAULT_PROVIDER
 
-    # -- API key -----------------------------------------------------------
-    api_key = layered("GROQ_API_KEY")
-    if environ.get("GROQ_API_KEY"):
-        key_source = "environment"
-    elif dotenv.get("GROQ_API_KEY"):
-        key_source = ENV_FILE_NAME
-    elif user_credentials.get("groq_api_key") or user_credentials.get("GROQ_API_KEY"):
-        key_source = "global-credentials"
-    elif user_config.get("groq_api_key") or user_config.get("GROQ_API_KEY"):
-        key_source = "user-config"
-    else:
-        key_source = "none"
+    # -- Provider Keys -----------------------------------------------------
+    groq_key = layered("GROQ_API_KEY")
+    gemini_key = layered("GEMINI_API_KEY")
+    openrouter_key = layered("OPENROUTER_API_KEY")
+    cerebras_key = layered("CEREBRAS_API_KEY")
+
+    active_env_var = {
+        "groq": "GROQ_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "cerebras": "CEREBRAS_API_KEY",
+    }.get(provider)
+
+    key_source = "none"
+    if active_env_var:
+        field_name = active_env_var.lower()
+        if environ.get(active_env_var):
+            key_source = "environment"
+        elif dotenv.get(active_env_var):
+            key_source = ENV_FILE_NAME
+        elif user_credentials.get(field_name) or user_credentials.get(active_env_var):
+            key_source = "global-credentials"
+        elif user_config.get(field_name) or user_config.get(active_env_var):
+            key_source = "user-config"
+    elif provider == "ollama":
+        key_source = "not-required"
 
     web_token = layered("NOVA_WEB_TOKEN")
 
     # -- Models & Ollama Endpoint ------------------------------------------
     generic_model = layered("NOVA_MODEL")
     groq_model = layered("GROQ_MODEL") or (generic_model if provider == "groq" else None) or DEFAULT_GROQ_MODEL
+    gemini_model = layered("GEMINI_MODEL") or (generic_model if provider == "gemini" else None) or DEFAULT_GEMINI_MODEL
     ollama_model = layered("OLLAMA_MODEL") or (generic_model if provider == "ollama" else None) or DEFAULT_OLLAMA_MODEL
+    openrouter_model = layered("OPENROUTER_MODEL") or (generic_model if provider == "openrouter" else None) or DEFAULT_OPENROUTER_MODEL
+    cerebras_model = layered("CEREBRAS_MODEL") or (generic_model if provider == "cerebras" else None) or DEFAULT_CEREBRAS_MODEL
     ollama_base_url = layered("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL
 
     # -- Remaining values --------------------------------------------------
@@ -407,10 +495,16 @@ def load_settings(
 
     settings = Settings(
         provider=provider,
-        groq_api_key=api_key,
+        groq_api_key=groq_key,
         groq_model=_as_str(groq_model, DEFAULT_GROQ_MODEL),
+        gemini_api_key=gemini_key,
+        gemini_model=_as_str(gemini_model, DEFAULT_GEMINI_MODEL),
         ollama_model=_as_str(ollama_model, DEFAULT_OLLAMA_MODEL),
         ollama_base_url=_as_str(ollama_base_url, DEFAULT_OLLAMA_BASE_URL),
+        openrouter_api_key=openrouter_key,
+        openrouter_model=_as_str(openrouter_model, DEFAULT_OPENROUTER_MODEL),
+        cerebras_api_key=cerebras_key,
+        cerebras_model=_as_str(cerebras_model, DEFAULT_CEREBRAS_MODEL),
         project_root=root,
         command_timeout=timeout,
         max_steps=max_steps,
@@ -440,6 +534,6 @@ def load_settings(
     if overrides:
         settings = settings.with_overrides(**overrides)
 
-    if require_api_key and settings.provider == "groq":
+    if require_api_key:
         settings.require_api_key()
     return settings

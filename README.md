@@ -305,3 +305,44 @@ Full unit, integration, and regression test suite covering native tool calling, 
 ## License
 
 MIT
+
+---
+
+## Provider & Model Switching
+
+NovaCLI supports 5 AI model providers:
+
+1. **Groq** (`groq`) — Default model `openai/gpt-oss-20b` (Requires `GROQ_API_KEY`)
+2. **Gemini** (`gemini`) — Default model `gemini-2.5-flash` (Requires `GEMINI_API_KEY`)
+3. **Ollama** (`ollama`) — Default model `qwen3:4b` at `http://localhost:11434` (No API key required)
+4. **OpenRouter** (`openrouter`) — Default model `openai/gpt-oss-20b` (Requires `OPENROUTER_API_KEY`)
+5. **Cerebras** (`cerebras`) — Default model `llama3.1-8b` (Requires `CEREBRAS_API_KEY`)
+
+### Configuring Provider & Model via CLI
+
+```bash
+# Switch active provider
+nova config provider groq
+nova config provider ollama
+nova config provider gemini
+nova config provider openrouter
+nova config provider cerebras
+
+# Set model for active provider
+nova config model openai/gpt-oss-20b
+nova config model qwen3:8b
+nova config model gemini-2.5-flash
+
+# View current configuration and available providers
+nova config
+```
+
+### Provider Environment Variables
+
+- `NOVA_PROVIDER`: Active provider (`groq`, `gemini`, `ollama`, `openrouter`, `cerebras`)
+- `NOVA_MODEL`: Active model override
+- `GROQ_API_KEY` / `GROQ_MODEL`
+- `GEMINI_API_KEY` / `GEMINI_MODEL`
+- `OLLAMA_MODEL` / `OLLAMA_BASE_URL`
+- `OPENROUTER_API_KEY` / `OPENROUTER_MODEL`
+- `CEREBRAS_API_KEY` / `CEREBRAS_MODEL`

@@ -70,7 +70,7 @@ def test_get_provider_builds_a_groq_provider() -> None:
 
 def test_get_provider_rejects_unknown_names() -> None:
     with pytest.raises(AIProviderError, match="Unknown provider"):
-        get_provider(SimpleNamespace(groq_api_key=SECRET), name="gemini")
+        get_provider(SimpleNamespace(groq_api_key=SECRET), name="invalid_provider_xyz")
 
 
 def test_default_model_constant() -> None:
