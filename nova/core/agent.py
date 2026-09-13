@@ -662,7 +662,10 @@ class NovaAgent:
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.raw_arguments if tc.raw_arguments else json.dumps(tc.arguments or {}),
+                        },
                     }
                     for tc in ai_response.tool_calls
                 ]
@@ -675,16 +678,16 @@ class NovaAgent:
 
                     yield AgentEvent(
                         EventType.TOOL_CALL,
-                        {"tool": action, "input": arguments},
+                        {"tool": action, "input": arguments if arguments is not None else {"raw": tc.raw_arguments}},
                         step=index,
                     )
 
                     # Handle malformed arguments
-                    if arguments.get("_invalid_json"):
-                        reason = f"Tool argument parsing failed: invalid JSON arguments: {arguments.get('raw')!r}"
+                    if arguments is None:
+                        reason = f"Tool argument parsing failed: invalid JSON arguments: {tc.raw_arguments!r}"
                         yield AgentEvent(
                             EventType.BLOCKED,
-                            {"tool": action, "reason": reason, "input": arguments},
+                            {"tool": action, "reason": reason, "input": {"raw": tc.raw_arguments}},
                             step=index,
                         )
                         result = ToolResult(
@@ -693,10 +696,10 @@ class NovaAgent:
                         steps.append(
                             AgentStep(
                                 index=index, thought="", action=action,
-                                action_input=arguments, result=result,
+                                action_input={"raw": tc.raw_arguments}, result=result,
                             )
                         )
-                        messages.append(Message.tool_result(tool_call_id, action, f"ERROR: {reason}"))
+                        messages.append(Message.tool_result(tool_call_id, action, f"Tool argument parsing failed: invalid JSON arguments."))
                         continue
 
                     # Safety check

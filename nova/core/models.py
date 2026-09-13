@@ -106,7 +106,8 @@ class ToolCall:
 
     id: str
     name: str
-    arguments: dict[str, Any] = field(default_factory=dict)
+    arguments: dict[str, Any] | None = None
+    raw_arguments: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return as_dict(self)
