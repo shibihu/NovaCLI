@@ -23,14 +23,16 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from nova import __version__
+from nova.ai import normalize_provider_name, provider_names
 from nova.config import (
-    API_KEY_HINT,
     DEFAULT_USER_CONFIG_PATH,
     DEFAULT_USER_CREDENTIALS_PATH,
     ConfigError,
     NovaConfigStore,
     Settings,
+    get_api_key_hint,
     load_settings,
+    prompt_and_save_api_key,
 )
 from nova.core.agent import AgentController, build_agent
 from nova.core.models import (
@@ -123,7 +125,7 @@ def _make_workspace(settings: Settings) -> Workspace:
     safety = SafetyPolicy(
         settings.project_root,
         settings.safety_mode,
-        secret_values=[settings.groq_api_key],
+        secret_values=settings.active_secrets,
     )
     return Workspace(
         settings.project_root, safety=safety, extra_ignore=settings.extra_ignore
@@ -321,7 +323,7 @@ def cmd_chat(args: argparse.Namespace, console: Console) -> int:
     )
     if not settings.has_api_key:
         console.warn("No API key configured — the agent cannot answer yet.")
-        console.write(console.paint(API_KEY_HINT, "dim"))
+        console.write(console.paint(get_api_key_hint(settings.provider), "dim"))
 
     agent = build_agent(settings)
     history: list[Message] = []
@@ -389,7 +391,7 @@ def cmd_run(args: argparse.Namespace, console: Console) -> int:
         return 2
 
     safety = SafetyPolicy(
-        settings.project_root, settings.safety_mode, secret_values=[settings.groq_api_key]
+        settings.project_root, settings.safety_mode, secret_values=settings.active_secrets
     )
     verdict = safety.check_command(command)
 
@@ -538,13 +540,44 @@ def cmd_config(args: argparse.Namespace, console: Console) -> int:
     store = NovaConfigStore()
     subcommand = getattr(args, "config_subcommand", None)
 
+    if subcommand == "provider":
+        prov_target = getattr(args, "provider_name", "").strip()
+        if not prov_target:
+            console.error("Provider name required.")
+            return 2
+        norm = normalize_provider_name(prov_target)
+        if norm not in provider_names():
+            console.error(f"Unknown provider '{prov_target}'. Available: {', '.join(provider_names())}")
+            return 2
+        old_prov = load_settings().provider
+        store.save_config({"provider": norm})
+        console.ok(f"Provider changed: {old_prov} -> {norm}")
+        return 0
+
+    if subcommand == "model":
+        model_target = getattr(args, "model_name", "").strip()
+        if not model_target:
+            console.error("Model name required.")
+            return 2
+        current_settings = load_settings()
+        prov = current_settings.provider
+        model_field = f"{prov}_model" if prov != "groq" else "groq_model"
+        store.save_config({model_field: model_target})
+        console.ok(f"Model for provider {prov} changed to: {model_target}")
+        return 0
+
     if subcommand == "set-key":
         key = getattr(args, "key", "").strip()
         if not key:
             console.error("API key cannot be empty.")
             return 2
-        store.save_credentials({"groq_api_key": key})
-        console.ok(f"Saved global Groq API key to {store.credentials_path}")
+        current_prov = load_settings().provider
+        if current_prov == "ollama":
+            console.error("Ollama does not require an API key.")
+            return 2
+        key_field = f"{current_prov}_api_key"
+        store.save_credentials({key_field: key})
+        console.ok(f"Saved global {current_prov.capitalize()} API key to {store.credentials_path}")
         return 0
 
     settings = _settings_from_args(args)
@@ -566,31 +599,38 @@ def cmd_config(args: argparse.Namespace, console: Console) -> int:
 
     console.title("◆ Nova Configuration")
     console.write()
-    console.write(f"  Global config:")
+    console.write("  Global config:")
     console.write(f"    {store.config_path}  {'✓' if config_exists else '✗'}")
     console.write()
-    console.write(f"  Credentials:")
+    console.write("  Credentials:")
     console.write(f"    {store.credentials_path}  {'✓' if creds_exists else '✗'}")
     console.write()
-    console.write(f"  Provider:")
-    console.write(f"    Groq")
+    console.write(f"  Active Provider: {settings.provider}")
+    console.write(f"  Active Model:    {settings.model}")
     console.write()
-    if settings.has_api_key:
+    console.write("  Available Providers:")
+    for p in provider_names():
+        check = "[x]" if p == settings.provider else "[ ]"
+        console.write(f"    {check} {p.capitalize()}")
+    console.write()
+
+    if settings.provider == "ollama":
+        console.write("  API key:")
+        console.write(f"    {console.paint('not required', 'cyan')}")
+        console.write(f"  Base URL: {settings.ollama_base_url}")
+    elif settings.has_api_key:
         source = f"(from {settings.api_key_source})"
-        console.write(f"  API key:")
+        console.write("  API key:")
         console.write(
             f"    {console.paint('configured', 'green')} "
             f"{console.paint(settings.masked_api_key, 'dim')} "
             f"{console.paint(source, 'dim')}"
         )
     else:
-        console.write(f"  API key:")
+        console.write("  API key:")
         console.write(f"    {console.paint('missing', 'red')}")
         console.write()
-        console.write(console.paint(API_KEY_HINT, "dim"))
-    console.write()
-    console.write(f"  Model:")
-    console.write(f"    {data['groq_model']}")
+        console.write(console.paint(get_api_key_hint(settings.provider), "dim"))
     console.write()
     console.write(f"  Project root:  {data['project_root']}")
     console.write(f"  Timeout:       {data['command_timeout']}s")
@@ -612,25 +652,25 @@ def cmd_doctor(args: argparse.Namespace, console: Console) -> int:
         console.error(f"Python {major}.{minor} is too old — 3.11+ required")
         failures += 1
 
-    for module, hint in (
-        ("groq", "pip install groq"),
-        ("fastapi", "pip install fastapi"),
-        ("uvicorn", "pip install uvicorn"),
-        ("jinja2", "pip install jinja2"),
-    ):
-        try:
-            __import__(module)
-            console.ok(f"module '{module}' available")
-        except ImportError:
-            console.warn(f"module '{module}' missing — {hint}")
-            if module == "groq":
-                failures += 1
+    console.write(f"  Selected Provider: {settings.provider}")
+    console.write(f"  Selected Model:    {settings.model}")
 
-    if settings.has_api_key:
-        console.ok(f"API key configured (from {settings.api_key_source})")
+    if settings.provider == "ollama":
+        console.ok("API key: not required for Ollama")
+        # Check Ollama server reachability
+        import urllib.request
+        try:
+            req = urllib.request.Request(f"{settings.ollama_base_url}/api/version")
+            with urllib.request.urlopen(req, timeout=3):
+                console.ok(f"Ollama server reachable at {settings.ollama_base_url}")
+        except Exception:
+            console.warn(f"Cannot reach Ollama server at {settings.ollama_base_url}")
     else:
-        console.warn("API key missing — set GROQ_API_KEY or use `nova config set-key`")
-        failures += 1
+        if settings.has_api_key:
+            console.ok(f"API key configured (from {settings.api_key_source})")
+        else:
+            console.warn(f"API key missing for {settings.provider} — set API key or use `nova config set-key`")
+            failures += 1
 
     if settings.project_root.is_dir():
         console.ok(f"workspace {settings.project_root}")
@@ -669,8 +709,11 @@ def cmd_init(args: argparse.Namespace, console: Console) -> int:
     template = "\n".join(
         [
             "# NovaCLI configuration — created by `nova init`",
+            "NOVA_PROVIDER=groq",
             "GROQ_API_KEY=",
-            "GROQ_MODEL=llama-3.3-70b-versatile",
+            "GROQ_MODEL=openai/gpt-oss-20b",
+            "OLLAMA_MODEL=qwen3:4b",
+            "OLLAMA_BASE_URL=http://localhost:11434",
             f"NOVA_PROJECT_ROOT={target}",
             "NOVA_COMMAND_TIMEOUT=30",
             "NOVA_MAX_STEPS=8",
@@ -682,7 +725,7 @@ def cmd_init(args: argparse.Namespace, console: Console) -> int:
     )
     env_path.write_text(template, encoding="utf-8")
     console.ok(f"Wrote {env_path}")
-    console.write(console.paint("  Next: paste your key from https://console.groq.com/keys", "dim"))
+    console.write(console.paint("  Next: set your API key in .env or ~/.nova/credentials.json", "dim"))
     console.write(console.paint("  Then: nova doctor", "dim"))
     return 0
 
@@ -734,8 +777,14 @@ def cmd_version(args: argparse.Namespace, console: Console) -> int:
 def _settings_from_args(args: argparse.Namespace, **extra: Any) -> Settings:
     """Build Settings from global flags, then per-command overrides."""
     overrides: dict[str, Any] = {}
+    if getattr(args, "provider", None):
+        overrides["provider"] = args.provider
     if getattr(args, "model", None):
         overrides["groq_model"] = args.model
+        overrides["ollama_model"] = args.model
+        overrides["gemini_model"] = args.model
+        overrides["openrouter_model"] = args.model
+        overrides["cerebras_model"] = args.model
     if getattr(args, "timeout", None):
         overrides["command_timeout"] = args.timeout
     if getattr(args, "safety", None):
@@ -778,7 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Global options, accepted both before and after the subcommand.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-C", "--project-root", help="Workspace root (default: current directory)")
-    common.add_argument("--model", help="Override the Groq model id")
+    common.add_argument("--provider", help="Override provider (groq, gemini, ollama, openrouter, cerebras)")
+    common.add_argument("--model", help="Override active model id")
     common.add_argument("--timeout", type=int, help="Per-command timeout in seconds")
     common.add_argument(
         "--safety",
@@ -860,8 +910,17 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub = p_config.add_subparsers(dest="config_subcommand")
     p_config_status = config_sub.add_parser("status", parents=[common], help="Show configuration status.")
     p_config_status.set_defaults(func=cmd_config)
-    p_config_set = config_sub.add_parser("set-key", parents=[common], help="Set global Groq API key.")
-    p_config_set.add_argument("key", help="The Groq API key (e.g. gsk_...)")
+
+    p_config_prov = config_sub.add_parser("provider", parents=[common], help="Set active provider.")
+    p_config_prov.add_argument("provider_name", help="Provider name (groq, gemini, ollama, openrouter, cerebras)")
+    p_config_prov.set_defaults(func=cmd_config)
+
+    p_config_mod = config_sub.add_parser("model", parents=[common], help="Set model for active provider.")
+    p_config_mod.add_argument("model_name", help="Model name / identifier")
+    p_config_mod.set_defaults(func=cmd_config)
+
+    p_config_set = config_sub.add_parser("set-key", parents=[common], help="Set global API key for active provider.")
+    p_config_set.add_argument("key", help="The API key")
     p_config_set.set_defaults(func=cmd_config)
     p_config.set_defaults(func=cmd_config)
 
