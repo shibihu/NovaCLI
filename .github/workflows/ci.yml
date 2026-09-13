@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - Novacli
+
   pull_request:
     branches:
       - main
@@ -35,11 +36,13 @@ jobs:
         run: |
           python -m pytest -q
 
+
   integration-test:
     name: Optional Real Groq Integration Test
     runs-on: ubuntu-latest
 
-    if: ${{ secrets.GROQ_API_KEY != '' }}
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
     steps:
       - name: Checkout Code
@@ -56,9 +59,21 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio httpx
 
+      - name: Check Groq API Key
+        id: check-key
+        shell: bash
+        run: |
+          if [ -n "$GROQ_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "GROQ_API_KEY is configured."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "GROQ_API_KEY is not configured. Skipping integration test."
+          fi
+
       - name: Run Real Groq Integration Test
+        if: steps.check-key.outputs.available == 'true'
         env:
           PYTHONPATH: .
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           python -m pytest tests/test_groq_integration.py -v
