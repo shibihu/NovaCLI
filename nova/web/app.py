@@ -1,8 +1,9 @@
 """FastAPI application factory for the NovaCLI web IDE.
 
-The app is intentionally thin. It holds a :class:`~nova.config.Settings`
-object and a :class:`~nova.web.events.SessionRegistry`, mounts static assets,
-and delegates every agent action to Nova Core.
+The app holds a :class:`~nova.config.Settings` object and a
+:class:`~nova.web.events.SessionRegistry`, mounts static assets, enforces
+authentication for non-localhost/LAN or configured token access, and
+delegates every agent action to Nova Core.
 """
 
 from __future__ import annotations
@@ -17,13 +18,8 @@ STATIC_DIR = WEB_ROOT / "static"
 
 
 def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
-    """Build the FastAPI application.
-
-    Settings are loaded lazily and may legitimately have no API key — the
-    server starts (so the UI can show setup instructions) and the error
-    surfaces when a task is submitted.
-    """
-    from fastapi import FastAPI
+    """Build the FastAPI application."""
+    from fastapi import FastAPI, HTTPException, Request, status
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.staticfiles import StaticFiles
 
@@ -46,8 +42,51 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     app.state.registry = SessionRegistry()
     app.state.version = __version__
 
-    # Local single-user tool: permissive CORS keeps the phone browser happy
-    # when the IDE is reached over a LAN address or a Termux port-forward.
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        """Enforce authentication on non-localhost or when a web token is required."""
+        path = request.url.path
+
+        # Unprotected static assets and index UI shell
+        if path == "/" or path.startswith("/static") or path in ("/favicon.ico", "/api/openapi.json", "/api/docs"):
+            return await call_next(request)
+
+        req_settings: Settings = app.state.settings
+        client_host = request.client.host if request.client else ""
+        is_local = client_host in ("127.0.0.1", "::1", "localhost", "testclient")
+
+        # Require authentication if configured token is set OR if request is coming from non-localhost (LAN/0.0.0.0)
+        token_required = req_settings.has_web_token or not is_local
+
+        if token_required:
+            auth_header = request.headers.get("authorization", "")
+            provided_token = ""
+
+            if auth_header.lower().startswith("bearer "):
+                provided_token = auth_header[7:].strip()
+
+            if not provided_token:
+                provided_token = request.query_params.get("token", "")
+
+            expected_token = req_settings.web_token
+
+            if not expected_token:
+                # If bound to LAN without a token set, deny access to state-changing endpoints for safety
+                if not provided_token or provided_token != expected_token:
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        content={"detail": "Authentication required for non-localhost/LAN requests. Set NOVA_WEB_TOKEN."},
+                    )
+            elif provided_token != expected_token:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "Invalid or missing Web API token."},
+                )
+
+        return await call_next(request)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -65,12 +104,10 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
 
 
 def get_settings(app: "FastAPI") -> Settings:  # noqa: F821
-    """Fetch the settings attached to a running app."""
     return app.state.settings
 
 
 def get_registry(app: "FastAPI") -> object:  # noqa: F821
-    """Fetch the session registry attached to a running app."""
     return app.state.registry
 
 

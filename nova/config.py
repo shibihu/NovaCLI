@@ -199,6 +199,7 @@ class Settings:
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT
     api_key_source: str = "none"
+    web_token: str | None = None
     reasoning_effort: str | None = None
     extra_ignore: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
@@ -219,6 +220,10 @@ class Settings:
     def masked_api_key(self) -> str:
         return mask_secret(self.groq_api_key)
 
+    @property
+    def has_web_token(self) -> bool:
+        return bool(self.web_token)
+
     def with_overrides(self, **changes: object) -> "Settings":
         """Return a copy with the given fields replaced."""
         return replace(self, **changes)  # type: ignore[arg-type]
@@ -236,6 +241,7 @@ class Settings:
             "has_api_key": self.has_api_key,
             "api_key_preview": self.masked_api_key,
             "api_key_source": self.api_key_source,
+            "has_web_token": self.has_web_token,
             "reasoning_effort": self.reasoning_effort,
         }
 
@@ -314,6 +320,8 @@ def load_settings(
     else:
         key_source = "none"
 
+    web_token = layered("NOVA_WEB_TOKEN")
+
     # -- Remaining values --------------------------------------------------
     model = layered("GROQ_MODEL") or DEFAULT_MODEL
     timeout = _as_int(
@@ -366,6 +374,7 @@ def load_settings(
             )
         ),
         api_key_source=key_source,
+        web_token=web_token,
         reasoning_effort=reasoning_effort,
         environment=dict(environ),
     )

@@ -2,7 +2,7 @@ name: NovaCLI CI
 
 on:
   push:
-    branches: [ main, fix/gpt-oss-tool-protocol ]
+    branches: [ main, fix/gpt-oss-tool-protocol, feature/*, fix/* ]
   pull_request:
     branches: [ main ]
 
@@ -23,13 +23,43 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest pytest-asyncio
+          pip install -r requirements.txt pytest pytest-asyncio build
 
       - name: Run Test Suite
         env:
           PYTHONPATH: .
         run: |
           pytest -q
+
+  package-test:
+    name: Build & Test Wheel Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions.checkout@v4
+
+      - name: Set up Python
+        uses: actions.setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify Package Contents & Execution
+        run: |
+          python -m venv /tmp/installed_env
+          /tmp/installed_env/bin/pip install dist/*.whl
+          /tmp/installed_env/bin/python -c "import nova; import nova.intelligence; print('Version:', nova.__version__)"
+          /tmp/installed_env/bin/nova version
+
+      - name: Run Pytest on Installed Package
+        run: |
+          /tmp/installed_env/bin/pip install pytest pytest-asyncio
+          /tmp/installed_env/bin/pytest tests/test_config.py tests/test_intelligence.py tests/test_cli.py -q
 
   integration-test:
     name: Optional Real Groq Integration Test

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "novacli"
-version = "1.0.0"
+version = "2.0.0"
 description = "NovaCLI — an AI-powered developer environment (agent + CLI + mobile Web IDE)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,13 +38,14 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "httpx>=0.27",
+  "build>=1.0",
 ]
 
 [project.scripts]
 nova = "nova.cli.commands:main"
 
-[tool.setuptools]
-packages = ["nova", "nova.core", "nova.ai", "nova.workspace", "nova.cli", "nova.web"]
+[tool.setuptools.packages.find]
+include = ["nova*"]
 
 [tool.setuptools.package-data]
 "nova.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js"]
