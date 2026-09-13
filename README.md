@@ -167,18 +167,19 @@ nova doctor
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
 | `groq_api_key` | `GROQ_API_KEY` | — | Provider credential |
-| `groq_model` | `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model id |
+| `groq_model` | `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq model id (GPT-OSS 20B recommended) |
 | `project_root` | `NOVA_PROJECT_ROOT` | current directory | Workspace root the agent may touch |
 | `command_timeout` | `NOVA_COMMAND_TIMEOUT` | `30` | Seconds before a command is killed |
 | `max_steps` | `NOVA_MAX_STEPS` | `8` | Agent reasoning steps per task |
 | `safety_mode` | `NOVA_SAFETY_MODE` | `smart` | `smart` \| `strict` \| `permissive` |
+| `reasoning_effort` | `NOVA_REASONING_EFFORT` | `None` | `low` \| `medium` \| `high` (for GPT-OSS models) |
 | `host` / `port` | `NOVA_HOST` / `NOVA_PORT` | `127.0.0.1` / `8000` | Web IDE bind address |
 
 ---
 
 ## Native Tool Calling
 
-NovaCLI supports native Groq/OpenAI tool calling. Rather than forcing models to generate raw text JSON, NovaCLI formats tools using standard JSON schema definitions and passes them via `tools` with `tool_choice="auto"`.
+NovaCLI uses native Groq/OpenAI tool calling. Rather than forcing models to generate raw text JSON, NovaCLI formats tools using standard JSON schema definitions and passes them via `tools` with `tool_choice="auto"`.
 
 ```
     Model (e.g. gpt-oss-20b, llama-3.3-70b)
@@ -297,7 +298,7 @@ override it.
 python -m pytest -q
 ```
 
-Full unit, integration, and regression test suite covering native tool calling, global credential resolution, Project Intelligence 2.0, workspace safety, agent controls, and Web API.
+Full unit, integration, and regression test suite covering native tool calling, global credential resolution, Project Intelligence 2.0, workspace safety, agent controls, and Web API. An optional integration test running against real Groq APIs (`openai/gpt-oss-20b`) is included in `tests/test_groq_integration.py` and runs automatically whenever `GROQ_API_KEY` is set in the environment.
 
 ---
 

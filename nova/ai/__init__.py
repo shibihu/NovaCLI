@@ -71,8 +71,9 @@ def get_provider(settings: object, name: str = "groq") -> AIProvider:
 
         return GroqProvider(
             api_key=getattr(settings, "groq_api_key", None),
-            model=getattr(settings, "groq_model", None) or "llama-3.3-70b-versatile",
+            model=getattr(settings, "groq_model", None) or "openai/gpt-oss-20b",
             timeout=float(getattr(settings, "command_timeout", 30)),
+            reasoning_effort=getattr(settings, "reasoning_effort", None),
         )
     raise AIProviderError(
         f"Unknown provider {name!r}. Available: {', '.join(provider_names())}"
