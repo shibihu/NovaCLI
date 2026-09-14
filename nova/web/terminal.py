@@ -1,8 +1,35 @@
-"""WebSocket terminal endpoint and PTY session transport for NovaCLI."""
+"""WebSocket terminal endpoint and PTY session transport for NovaCLI.
+
+The endpoint is a thin transport between a browser xterm.js instance and a
+platform PTY session. It only ever touches the common
+:class:`~nova.core.pty.base.PTYSession` interface (``is_alive``, ``pid``,
+``returncode``, ``resize``, ``write``, ``read``, ``close``) so it behaves
+identically on Unix, WSL, Termux and Windows.
+
+Wire protocol
+-------------
+Client -> server::
+
+    {"type": "input",  "data": "ls\\r"}
+    {"type": "resize", "cols": 120, "rows": 30}
+    {"type": "ping"}
+
+Server -> client::
+
+    {"type": "output", "data": "..."}
+    {"type": "exit",   "code": 0}
+    {"type": "pong"}
+    {"type": "error",  "message": "..."}
+
+The server never echoes input itself — character echo and line editing are the
+shell's job, provided by the PTY (POSIX line discipline or the Windows
+pseudoconsole).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 
@@ -15,9 +42,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 pty_manager = PTYManager()
 
+#: A frame can hold at most this much console output (bytes read from the PTY).
+_READ_CHUNK = 4096
+
+#: How many times to re-drain the PTY after the shell has exited so the final
+#: lines of output are not lost to the race between process exit and read.
+_FINAL_DRAIN_ATTEMPTS = 6
+
 
 def verify_ws_auth(websocket: WebSocket) -> bool:
-    """Verify WebSocket client authentication against settings."""
+    """Verify WebSocket client authentication against settings.
+
+    Header credentials (``Authorization: Bearer`` and ``X-Nova-Web-Token``) are
+    preferred. A ``?token=`` query parameter is still accepted because browser
+    WebSocket clients cannot set request headers on the handshake.
+    """
     app = websocket.app
     settings = getattr(app.state, "settings", None)
     web_token = settings.web_token if settings else None
@@ -43,14 +82,134 @@ def verify_ws_auth(websocket: WebSocket) -> bool:
     return bool(provided_token and provided_token == web_token)
 
 
+def _redact(message: str, websocket: WebSocket) -> str:
+    """Remove any configured secret values from an error message.
+
+    Terminal startup errors must stay diagnosable without ever leaking API keys,
+    tokens or passwords into the browser or the logs.
+    """
+    settings = getattr(websocket.app.state, "settings", None)
+    secrets = getattr(settings, "active_secrets", None) or ()
+    text = str(message)
+    for secret in secrets:
+        if secret and len(str(secret)) >= 6:
+            text = text.replace(str(secret), "***")
+    return text
+
+
+async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
+    """Send JSON, tolerating a socket that is already closing."""
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception:  # pragma: no cover - race with client disconnect
+        return False
+
+
+async def _send_error(websocket: WebSocket, message: str) -> None:
+    """Send a structured, redacted error to the client."""
+    await _safe_send_json(
+        websocket, {"type": "error", "message": _redact(message, websocket)}
+    )
+
+
+async def _pump_pty_output(websocket: WebSocket, session) -> None:
+    """Stream PTY output to the WebSocket until the shell exits.
+
+    Runs as its own task so a slow or dead client can never stall the shell.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        while session.is_alive:
+            data = await loop.run_in_executor(None, session.read, _READ_CHUNK)
+            if not data:
+                await asyncio.sleep(0.02)
+                continue
+            if not await _safe_send_json(
+                websocket,
+                {"type": "output", "data": data.decode("utf-8", errors="replace")},
+            ):
+                return
+    except asyncio.CancelledError:
+        raise
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("PTY output stream error (session %s): %s", session.id, exc)
+        return
+
+    # The shell exited: give the reader a moment to flush its last bytes.
+    for _ in range(_FINAL_DRAIN_ATTEMPTS):
+        try:
+            data = await loop.run_in_executor(None, session.read, _READ_CHUNK)
+        except Exception:
+            break
+        if data:
+            if not await _safe_send_json(
+                websocket,
+                {"type": "output", "data": data.decode("utf-8", errors="replace")},
+            ):
+                return
+        else:
+            await asyncio.sleep(0.05)
+
+    code = session.returncode
+    if code is not None:
+        await _safe_send_json(websocket, {"type": "exit", "code": code})
+
+
+async def _terminal_input_loop(websocket: WebSocket, session) -> None:
+    """Forward client messages into the PTY until the shell exits."""
+    while session.is_alive:
+        raw_msg = await websocket.receive_text()
+        if not raw_msg:
+            continue
+
+        try:
+            msg = json.loads(raw_msg)
+        except json.JSONDecodeError:
+            # Not JSON: treat the payload as raw keystroke data.
+            session.write(raw_msg)
+            continue
+
+        if not isinstance(msg, dict):
+            # A JSON scalar (string/number) is still usable as literal input.
+            session.write(raw_msg)
+            continue
+
+        msg_type = msg.get("type", "input")
+
+        if msg_type == "input":
+            data = msg.get("data", "")
+            if isinstance(data, str) and data:
+                session.write(data)
+
+        elif msg_type == "resize":
+            try:
+                new_cols = int(msg.get("cols", session.cols))
+                new_rows = int(msg.get("rows", session.rows))
+            except (TypeError, ValueError):
+                await _send_error(websocket, "Invalid resize dimensions.")
+                continue
+            try:
+                session.resize(new_cols, new_rows)
+            except Exception as exc:
+                logger.warning("PTY resize failed (session %s): %s", session.id, exc)
+                await _send_error(websocket, f"Resize failed: {exc}")
+
+        elif msg_type == "ping":
+            await _safe_send_json(websocket, {"type": "pong"})
+
+
 @router.websocket("/ws/terminal")
 async def terminal_websocket(websocket: WebSocket) -> None:
     """Interactive WebSocket endpoint connected to an OS PTY shell."""
     await websocket.accept()
 
     if not verify_ws_auth(websocket):
-        await websocket.send_json(
-            {"type": "error", "message": "Invalid or missing authentication token."}
+        await _safe_send_json(
+            websocket,
+            {"type": "error", "message": "Invalid or missing authentication token."},
         )
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -65,66 +224,41 @@ async def terminal_websocket(websocket: WebSocket) -> None:
     except (ValueError, TypeError):
         cols, rows = 80, 24
 
-    # Create new PTY session
-    session = pty_manager.create(project_root, cols=cols, rows=rows)
+    # Create the PTY session. Failures are surfaced to the client instead of
+    # being swallowed, because a terminal that cannot start is unusable.
+    try:
+        session = pty_manager.create(project_root, cols=cols, rows=rows)
+    except Exception as exc:
+        logger.error("Failed to start PTY terminal session: %s", exc)
+        await _send_error(websocket, f"Failed to start terminal: {exc}")
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
 
-    # Background task to stream PTY output to WebSocket
-    async def stream_pty_output():
-        loop = asyncio.get_running_loop()
-        try:
-            while session.is_alive:
-                # Read output in thread to avoid blocking loop
-                data = await loop.run_in_executor(None, session.read, 4096)
-                if not data:
-                    await asyncio.sleep(0.02)
-                    continue
-                decoded = data.decode("utf-8", errors="replace")
-                await websocket.send_json({"type": "output", "data": decoded})
-        except (WebSocketDisconnect, RuntimeError, OSError):
-            pass
-        except Exception as exc:
-            logger.debug("PTY output stream error: %s", exc)
-        finally:
-            if not session.is_alive and session.process.returncode is not None:
-                try:
-                    await websocket.send_json(
-                        {"type": "exit", "code": session.process.returncode}
-                    )
-                except Exception:
-                    pass
-
-    output_task = asyncio.create_task(stream_pty_output())
+    # Pump output and input concurrently. Whichever finishes first ends the
+    # session: the shell exiting tears down the socket, and the client
+    # disconnecting stops the pump. This keeps the lifecycle deterministic
+    # instead of waiting for the next client message to notice a dead shell.
+    output_task = asyncio.create_task(_pump_pty_output(websocket, session))
+    input_task = asyncio.create_task(_terminal_input_loop(websocket, session))
+    tasks = (output_task, input_task)
 
     try:
-        while session.is_alive:
-            raw_msg = await websocket.receive_text()
-            if not raw_msg:
-                continue
-
-            try:
-                msg = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                # Treat raw text input as keystroke data
-                session.write(raw_msg)
-                continue
-
-            msg_type = msg.get("type", "input")
-            if msg_type == "input":
-                data = msg.get("data", "")
-                if data:
-                    session.write(data)
-            elif msg_type == "resize":
-                new_cols = int(msg.get("cols", session.cols))
-                new_rows = int(msg.get("rows", session.rows))
-                session.resize(new_cols, new_rows)
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        logger.debug("WebSocket terminal error: %s", exc)
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        output_task.cancel()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+            elif not task.cancelled() and task.exception() is not None:
+                exc = task.exception()
+                if isinstance(exc, WebSocketDisconnect):
+                    logger.debug("Terminal client disconnected (session %s)", session.id)
+                else:
+                    logger.warning(
+                        "WebSocket terminal error (session %s): %s", session.id, exc
+                    )
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         pty_manager.close(session.id)
 
 

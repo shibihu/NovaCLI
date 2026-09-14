@@ -1,14 +1,29 @@
-"""Windows ConPTY (Pseudoconsole) implementation for interactive terminal sessions."""
+"""Windows ConPTY (Pseudoconsole) implementation for interactive terminal sessions.
+
+This backend attaches the shell to a real Windows pseudoconsole via the ConPTY
+API (``CreatePseudoConsole``). Using a pseudoconsole — rather than anonymous
+pipes — is what makes the web terminal genuinely interactive on Windows:
+
+* the console line discipline echoes typed characters as you type,
+* backspace / arrow keys / Tab / Ctrl+C / Ctrl+D work,
+* ANSI/VT escape sequences emitted by the shell are preserved,
+* interactive programs (``python``, ``more``, sub-shells, ...) can be driven.
+
+The API is bound directly with :mod:`ctypes`, so no extra dependency (and no C
+toolchain) is required. Windows 10 1809+ is required; on older builds a clear
+``RuntimeError`` is raised so the WebSocket layer can report it.
+"""
 
 from __future__ import annotations
 
 import collections
+import ctypes
 import logging
 import os
 import shutil
-import subprocess
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 from typing import Mapping
 
@@ -17,8 +32,206 @@ from nova.core.runner import SCRUBBED_ENV_KEYS
 
 logger = logging.getLogger(__name__)
 
-# Windows API constants
-CREATE_NEW_PROCESS_GROUP = 0x00000200
+# ---------------------------------------------------------------------------
+# Win32 constants
+# ---------------------------------------------------------------------------
+
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+
+# Without STARTF_USESTDHANDLES, CreateProcess duplicates the *parent's* standard
+# handles into a console child even when handle inheritance is disabled. That
+# makes the shell talk to the parent console instead of the pseudoconsole, which
+# is exactly the "typing produces no output" failure mode. Setting the flag with
+# NULL std handles forces the child onto the ConPTY.
+# See microsoft/terminal discussion #15814.
+STARTF_USESTDHANDLES = 0x00000100
+STILL_ACTIVE = 259
+WAIT_TIMEOUT = 0x00000102
+WAIT_OBJECT_0 = 0x00000000
+
+
+# ---------------------------------------------------------------------------
+# Win32 structures
+# ---------------------------------------------------------------------------
+
+
+class COORD(ctypes.Structure):
+    """Console coordinate (used for the pseudoconsole size)."""
+
+    _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+
+class SECURITY_ATTRIBUTES(ctypes.Structure):
+    """Win32 ``SECURITY_ATTRIBUTES`` for inheritable pipe handles."""
+
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+class STARTUPINFOW(ctypes.Structure):
+    """Win32 ``STARTUPINFOW``."""
+
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+
+class STARTUPINFOEXW(ctypes.Structure):
+    """Win32 ``STARTUPINFOEXW`` (``STARTUPINFOW`` plus an attribute list)."""
+
+    _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", wintypes.LPVOID)]
+
+
+class PROCESS_INFORMATION(ctypes.Structure):
+    """Win32 ``PROCESS_INFORMATION``."""
+
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+_kernel32 = None
+_api_lock = threading.Lock()
+
+
+def _kernel32_api():
+    """Load and bind the ConPTY/kernel32 entry points exactly once.
+
+    Raises:
+        RuntimeError: If the ConPTY API is unavailable (pre-1809 Windows).
+    """
+    global _kernel32
+    with _api_lock:
+        if _kernel32 is not None:
+            return _kernel32
+
+        if os.name != "nt":
+            raise RuntimeError("ConPTY is only available on Windows.")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        try:
+            kernel32.CreatePseudoConsole
+            kernel32.ResizePseudoConsole
+            kernel32.ClosePseudoConsole
+        except AttributeError as exc:  # pragma: no cover - old Windows only
+            raise RuntimeError(
+                "ConPTY is unavailable on this Windows version "
+                "(Windows 10 1809 or newer is required)."
+            ) from exc
+
+        kernel32.CreatePseudoConsole.argtypes = [
+            COORD,
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        kernel32.CreatePseudoConsole.restype = ctypes.c_long  # HRESULT
+
+        kernel32.ResizePseudoConsole.argtypes = [wintypes.HANDLE, COORD]
+        kernel32.ResizePseudoConsole.restype = ctypes.c_long  # HRESULT
+
+        kernel32.ClosePseudoConsole.argtypes = [wintypes.HANDLE]
+        kernel32.ClosePseudoConsole.restype = None
+
+        kernel32.CreatePipe.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            ctypes.POINTER(wintypes.HANDLE),
+            ctypes.POINTER(SECURITY_ATTRIBUTES),
+            wintypes.DWORD,
+        ]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+
+        kernel32.InitializeProcThreadAttributeList.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+
+        kernel32.UpdateProcThreadAttribute.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+            wintypes.LPVOID,
+            ctypes.c_size_t,
+            wintypes.LPVOID,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+
+        kernel32.DeleteProcThreadAttributeList.argtypes = [wintypes.LPVOID]
+        kernel32.DeleteProcThreadAttributeList.restype = None
+
+        kernel32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPCWSTR,
+            wintypes.LPVOID,
+            ctypes.POINTER(PROCESS_INFORMATION),
+        ]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+
+        for name in ("ReadFile", "WriteFile"):
+            func = getattr(kernel32, name)
+            func.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.LPVOID,
+            ]
+            func.restype = wintypes.BOOL
+
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+        _kernel32 = kernel32
+        return _kernel32
 
 
 def _find_shell() -> str:
@@ -51,11 +264,18 @@ def _find_shell() -> str:
     raise RuntimeError("No Windows shell found (cmd.exe or powershell.exe)")
 
 
+def _build_env_block(env: Mapping[str, str]) -> ctypes.Array:
+    """Serialise *env* into the UTF-16 environment block Windows expects."""
+    entries = "".join(f"{key}={value}\0" for key, value in env.items())
+    return ctypes.create_unicode_buffer(entries + "\0")
+
+
 class PTYSession(PTYSessionBase):
     """Windows ConPTY session managing one interactive shell process.
-    
-    This implementation uses subprocess with pipe-based I/O and a background
-    reader thread to collect output. A thread-safe deque buffers output data.
+
+    The shell runs attached to a real pseudoconsole. A background reader thread
+    drains console output into a thread-safe buffer, mirroring the blocking
+    behaviour of the POSIX backend.
     """
 
     def __init__(
@@ -68,7 +288,7 @@ class PTYSession(PTYSessionBase):
         shell_path: str | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
-        """Initialize Windows PTY session."""
+        """Initialize Windows ConPTY session."""
         super().__init__(session_id, cwd, cols=cols, rows=rows, shell_path=shell_path, env=env)
 
         self.shell_path = shell_path or _find_shell()
@@ -87,181 +307,288 @@ class PTYSession(PTYSessionBase):
         )
         self.env = base_env
 
-        # Output buffer using thread-safe deque
-        self.output_buffer = collections.deque(maxlen=10000)  # Keep last 10000 chunks
+        # Output buffer (thread-safe) filled by the reader thread
+        self.output_buffer: collections.deque[bytes] = collections.deque(maxlen=10000)
         self.output_lock = threading.Lock()
-        self.reader_thread = None
+        self.reader_thread: threading.Thread | None = None
 
-        # Spawn shell with pipes
+        # Win32 handles / state
+        self._hpc: int | None = None
+        self._h_in_write: int | None = None
+        self._h_out_read: int | None = None
+        self._h_process: int | None = None
+        self._h_thread: int | None = None
+        self._pid: int | None = None
+        self._returncode: int | None = None
+
         self._create_pty()
 
+    # -- Creation ----------------------------------------------------------
+
     def _create_pty(self) -> None:
-        """Create and spawn shell process with pipes for I/O."""
+        """Create the pseudoconsole and spawn the shell attached to it."""
+        kernel32 = _kernel32_api()
+
+        # Two anonymous pipes: one carrying our input to the console, one
+        # carrying the console's output back to us.
+        sa = SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+        sa.bInheritHandle = True
+
+        in_read = wintypes.HANDLE()
+        in_write = wintypes.HANDLE()
+        out_read = wintypes.HANDLE()
+        out_write = wintypes.HANDLE()
+
+        if not kernel32.CreatePipe(
+            ctypes.byref(in_read), ctypes.byref(in_write), ctypes.byref(sa), 0
+        ):
+            raise OSError(ctypes.get_last_error(), "CreatePipe (stdin) failed")
+        if not kernel32.CreatePipe(
+            ctypes.byref(out_read), ctypes.byref(out_write), ctypes.byref(sa), 0
+        ):
+            kernel32.CloseHandle(in_read)
+            kernel32.CloseHandle(in_write)
+            raise OSError(ctypes.get_last_error(), "CreatePipe (stdout) failed")
+
+        # Create the pseudoconsole. It duplicates the handles it is given.
+        hpc = wintypes.HANDLE()
+        cols = max(10, min(500, int(self.cols)))
+        rows = max(5, min(200, int(self.rows)))
+        hr = kernel32.CreatePseudoConsole(
+            COORD(cols, rows), in_read, out_write, 0, ctypes.byref(hpc)
+        )
+        if hr != 0:
+            for handle in (in_read, in_write, out_read, out_write):
+                kernel32.CloseHandle(handle)
+            raise OSError(f"CreatePseudoConsole failed (HRESULT 0x{hr & 0xFFFFFFFF:08x})")
+
+        self._hpc = hpc
+        self._h_in_write = in_write
+        self._h_out_read = out_read
+        self.cols = cols
+        self.rows = rows
+
+        attribute_list = None
         try:
-            # Spawn the shell process with pipes
-            self.process = subprocess.Popen(
-                [self.shell_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=str(self.cwd),
-                env=self.env,
-                creationflags=CREATE_NEW_PROCESS_GROUP,
-                text=False,
-                bufsize=0,
-            )
-            self._pid = self.process.pid
+            # Prepare the pseudo-console attribute for the child process.
+            size = ctypes.c_size_t(0)
+            kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+            attribute_list = ctypes.create_string_buffer(size.value)
+            attr_ptr = ctypes.cast(attribute_list, wintypes.LPVOID)
+            if not kernel32.InitializeProcThreadAttributeList(
+                attr_ptr, 1, 0, ctypes.byref(size)
+            ):
+                raise OSError(ctypes.get_last_error(), "InitializeProcThreadAttributeList failed")
+            if not kernel32.UpdateProcThreadAttribute(
+                attr_ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                hpc,
+                ctypes.sizeof(wintypes.HANDLE),
+                None,
+                None,
+            ):
+                raise OSError(ctypes.get_last_error(), "UpdateProcThreadAttribute failed")
 
-            # Start background thread to read process output
-            self.reader_thread = threading.Thread(
-                target=self._reader_thread_func, daemon=True
-            )
-            self.reader_thread.start()
-            
-            # Give the reader thread a moment to start
-            time.sleep(0.05)
+            si = STARTUPINFOEXW()
+            si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+            si.lpAttributeList = attr_ptr
 
-        except Exception as e:
-            logger.error(f"Windows PTY initialization failed: {e}")
+            env_block = _build_env_block(self.env)
+            command_line = ctypes.create_unicode_buffer(f'"{self.shell_path}"')
+            pi = PROCESS_INFORMATION()
+
+            created = kernel32.CreateProcessW(
+                self.shell_path,
+                command_line,
+                None,
+                None,
+                False,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                ctypes.cast(env_block, wintypes.LPVOID),
+                str(self.cwd),
+                ctypes.byref(si),
+                ctypes.byref(pi),
+            )
+            if not created:
+                raise OSError(ctypes.get_last_error(), "CreateProcessW failed")
+
+            self._h_process = pi.hProcess
+            self._h_thread = pi.hThread
+            self._pid = int(pi.dwProcessId)
+        except Exception:
+            # Roll back the pseudoconsole on any failure so nothing leaks.
+            if self._hpc:
+                kernel32.ClosePseudoConsole(self._hpc)
+                self._hpc = None
+            self._close_handles()
             raise
+        finally:
+            if attribute_list is not None:
+                kernel32.DeleteProcThreadAttributeList(
+                    ctypes.cast(attribute_list, wintypes.LPVOID)
+                )
+            # The pseudoconsole owns its copies of these handles now.
+            kernel32.CloseHandle(in_read)
+            kernel32.CloseHandle(out_write)
+
+        # Start draining console output on a background thread.
+        self.reader_thread = threading.Thread(
+            target=self._reader_thread_func,
+            name=f"nova-conpty-reader-{self.id}",
+            daemon=True,
+        )
+        self.reader_thread.start()
+
+    # -- Reader thread -----------------------------------------------------
 
     def _reader_thread_func(self) -> None:
-        """Background thread that reads process output and buffers it."""
-        if not self.process or not self.process.stdout:
+        """Block on ``ReadFile`` and buffer every console output chunk."""
+        kernel32 = _kernel32_api()
+        handle = self._h_out_read
+        if not handle:
             return
 
+        buffer = ctypes.create_string_buffer(4096)
+        read = wintypes.DWORD(0)
+
         try:
-            while self.process.poll() is None:
-                try:
-                    chunk = self.process.stdout.read(4096)
-                    if chunk:
-                        with self.output_lock:
-                            # Add chunk to deque (automatically evicts oldest if full)
-                            self.output_buffer.append(chunk)
-                    else:
-                        # Empty read, small sleep to avoid busy loop
-                        time.sleep(0.01)
-                except (IOError, OSError):
+            while True:
+                ok = kernel32.ReadFile(handle, buffer, 4096, ctypes.byref(read), None)
+                if not ok or read.value == 0:
                     break
-            
-            # Final read for any remaining output
-            try:
-                remaining = self.process.stdout.read()
-                if remaining:
-                    with self.output_lock:
-                        self.output_buffer.append(remaining)
-            except Exception:
-                pass
-                
-        except Exception as e:
-            logger.debug(f"Reader thread error: {e}")
+                chunk = buffer.raw[: read.value]
+                with self.output_lock:
+                    self.output_buffer.append(chunk)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("ConPTY reader thread stopped: %s", exc)
+
+    # -- PTYSession interface ---------------------------------------------
 
     @property
     def pid(self) -> int | None:
-        """Get the process ID of the shell."""
-        return self._pid if hasattr(self, "_pid") else None
+        """Get the process ID of the shell, or None if not running."""
+        return self._pid
 
     @property
     def returncode(self) -> int | None:
         """Get the process exit code, or None if still running."""
-        if hasattr(self, "process") and self.process:
-            return self.process.returncode
-        return None
+        if self._returncode is not None:
+            return self._returncode
+        if not self._h_process:
+            return None
+        code = wintypes.DWORD(0)
+        if not _kernel32_api().GetExitCodeProcess(self._h_process, ctypes.byref(code)):
+            return None
+        if code.value == STILL_ACTIVE:
+            return None
+        self._returncode = int(code.value)
+        return self._returncode
 
     @property
     def is_alive(self) -> bool:
-        """Check if the PTY session is still running."""
+        """Check if the PTY session and child shell are still running."""
         if self._closed:
             return False
-        if not hasattr(self, "process"):
+        if not self._h_process:
             return False
-        return self.process.poll() is None
+        return self.returncode is None
 
     def resize(self, cols: int, rows: int) -> None:
-        """Resize the terminal window dimensions.
-        
-        Note: On Windows with pipes, we track dimensions but cannot resize
-        the underlying console. This is a limitation of pipe-based approach.
-        """
+        """Resize the pseudoconsole window so the shell sees the new size."""
         if self._closed:
             return
-        
+
         cols = max(10, min(500, int(cols)))
         rows = max(5, min(200, int(rows)))
-        
+
         self.cols = cols
         self.rows = rows
 
-    def write(self, data: bytes | str) -> None:
-        """Write user input to the shell's stdin."""
-        if self._closed or not self.process or not self.process.stdin:
+        if not self._hpc:
             return
-        
-        raw = data.encode("utf-8") if isinstance(data, str) else data
+        hr = _kernel32_api().ResizePseudoConsole(self._hpc, COORD(cols, rows))
+        if hr != 0:
+            logger.warning(
+                "ResizePseudoConsole failed for session %s (HRESULT 0x%08x)",
+                self.id,
+                hr & 0xFFFFFFFF,
+            )
+
+    def write(self, data: bytes | str) -> None:
+        """Write user input bytes or text to the pseudoconsole input."""
+        if self._closed or not self._h_in_write:
+            return
+
+        raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         if not raw:
             return
 
-        try:
-            self.process.stdin.write(raw)
-            self.process.stdin.flush()
-        except (OSError, ValueError, BrokenPipeError) as exc:
-            logger.debug(f"Windows PTY write error on session {self.id}: {exc}")
+        written = wintypes.DWORD(0)
+        ok = _kernel32_api().WriteFile(
+            self._h_in_write, raw, len(raw), ctypes.byref(written), None
+        )
+        if not ok:
+            logger.debug("ConPTY write failed on session %s", self.id)
             self.close()
 
     def read(self, max_bytes: int = 4096) -> bytes:
-        """Read available output from the shell.
-        
-        Drains output buffer chunks up to max_bytes.
-        """
+        """Drain buffered console output (never blocks)."""
         if self._closed:
             return b""
 
         with self.output_lock:
             if not self.output_buffer:
                 return b""
-            
-            # Collect chunks from buffer up to max_bytes
+
             result = b""
             while self.output_buffer and len(result) < max_bytes:
-                chunk = self.output_buffer.popleft()
-                result += chunk
-            
+                result += self.output_buffer.popleft()
             return result
 
     def close(self) -> None:
-        """Terminate the shell process and clean up resources."""
+        """Close the pseudoconsole, terminate the shell and free all handles."""
         if self._closed:
             return
         self._closed = True
 
-        # Close the shell process
-        if hasattr(self, "process") and self.process:
-            if self.process.stdin:
-                try:
-                    self.process.stdin.close()
-                except Exception:
-                    pass
+        kernel32 = _kernel32_api()
 
-            if self.process.stdout:
-                try:
-                    self.process.stdout.close()
-                except Exception:
-                    pass
+        # Closing the pseudoconsole ends the console session for the child.
+        if self._hpc:
+            kernel32.ClosePseudoConsole(self._hpc)
+            self._hpc = None
 
-            if self.process.poll() is None:
-                try:
-                    self.process.terminate()
-                    self.process.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        self.process.kill()
-                        self.process.wait(timeout=1.0)
-                    except Exception as e:
-                        logger.debug(f"Error killing shell process: {e}")
-                except Exception as e:
-                    logger.debug(f"Error terminating shell process: {e}")
+        # Wait for the shell to exit, forcing it if it lingers.
+        if self._h_process:
+            if kernel32.WaitForSingleObject(self._h_process, 1000) == WAIT_TIMEOUT:
+                kernel32.TerminateProcess(self._h_process, 1)
+                kernel32.WaitForSingleObject(self._h_process, 1000)
+            code = wintypes.DWORD(0)
+            if kernel32.GetExitCodeProcess(self._h_process, ctypes.byref(code)):
+                self._returncode = int(code.value)
+
+        # Let the reader thread observe the console close and finish.
+        if self.reader_thread and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=1.0)
+
+        self._close_handles()
+
+    def _close_handles(self) -> None:
+        """Close every Win32 handle this session still owns."""
+        kernel32 = _kernel32_api()
+        for attr in ("_h_in_write", "_h_out_read"):
+            handle = getattr(self, attr, None)
+            if handle:
+                kernel32.CloseHandle(handle)
+                setattr(self, attr, None)
+        for attr in ("_h_thread", "_h_process"):
+            handle = getattr(self, attr, None)
+            if handle:
+                kernel32.CloseHandle(handle)
+                setattr(self, attr, None)
 
 
-__all__ = ["PTYSession"]
-
-
+__all__ = ["PTYSession", "_find_shell"]

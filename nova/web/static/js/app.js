@@ -445,7 +445,9 @@
           foreground: "#c9d1d9",
           cursor: "#58a6ff",
         },
-        convertEol: true,
+        // A real PTY/ConPTY already emits CRLF and cursor positioning. Rewriting
+        // line endings here would corrupt full-screen and interactive programs.
+        convertEol: false,
       });
 
       if (typeof FitAddon !== "undefined" && FitAddon.FitAddon) {
@@ -455,6 +457,22 @@
 
       termInstance.open(container);
       if (fitAddon) fitAddon.fit();
+
+      // Focus the real xterm surface (an off-screen textarea owned by xterm.js).
+      // Without this the terminal renders but keystrokes have nowhere to go.
+      termInstance.focus();
+
+      // The container only reaches its final size after the tab is laid out, so
+      // re-fit and re-focus once the browser has settled.
+      setTimeout(() => {
+        if (fitAddon) fitAddon.fit();
+        if (termInstance) termInstance.focus();
+      }, 50);
+
+      // Tapping the terminal focuses xterm directly (desktop and mobile).
+      container.addEventListener("pointerdown", () => {
+        if (termInstance) termInstance.focus();
+      });
 
       connectTerminalWs();
 
@@ -480,8 +498,11 @@
           fitAddon.fit();
         }
       });
-    } else if (fitAddon && termInstance) {
-      setTimeout(() => fitAddon.fit(), 50);
+    } else if (termInstance) {
+      setTimeout(() => {
+        if (fitAddon) fitAddon.fit();
+        termInstance.focus();
+      }, 50);
     }
   }
 
@@ -500,6 +521,7 @@
 
       termWs.onopen = () => {
         if (fitAddon && termInstance) fitAddon.fit();
+        if (termInstance) termInstance.focus();
       };
 
       termWs.onmessage = (event) => {
