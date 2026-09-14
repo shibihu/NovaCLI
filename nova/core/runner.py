@@ -19,7 +19,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .models import RunResult
 from .safety import SafetyMode, SafetyPolicy
@@ -28,7 +28,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 200_000
 _GRACE_PERIOD_SECONDS = 2.0
 
 # Environment variables NovaCLI injects and must never hand to a child process.
-SCRUBBED_ENV_KEYS: tuple[str, ...] = ("GROQ_API_KEY", "NOVA_GROQ_API_KEY")
+SCRUBBED_ENV_KEYS: tuple[str, ...] = ("GROQ_API_KEY", "NOVA_GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "NOVA_WEB_TOKEN")
 
 # Basenames that indicate a shell is available.
 _SHELL_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/system/bin/sh")
@@ -51,6 +51,164 @@ def _truncate(text: str, limit: int) -> str:
     return f"{head}\n... [{removed} bytes truncated] ...\n{tail}"
 
 
+@runtime_checkable
+class ExecutionBackend(Protocol):
+    """Abstraction for command execution backends (Local host vs Docker sandbox)."""
+
+    async def run(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        """Execute command and return (exit_code, stdout, stderr, timed_out)."""
+        ...
+
+
+class LocalBackend:
+    """Local host execution backend."""
+
+    async def run(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+
+        shell = _find_shell()
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            executable=shell,
+            env=env,
+            **popen_kwargs,
+        )
+
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            await self._terminate(process)
+            stdout_b, stderr_b = await self._drain(process)
+        except asyncio.CancelledError:
+            await self._terminate(process)
+            raise
+
+        stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+        exit_code = process.returncode if not timed_out else None
+
+        return exit_code, stdout, stderr, timed_out
+
+    @staticmethod
+    async def _drain(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+        try:
+            return await asyncio.wait_for(process.communicate(), timeout=_GRACE_PERIOD_SECONDS)
+        except (asyncio.TimeoutError, ProcessLookupError, ValueError):
+            return b"", b""
+
+    @staticmethod
+    async def _terminate(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.terminate()
+            except (ProcessLookupError, OSError):
+                return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_GRACE_PERIOD_SECONDS)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            if os.name == "posix":
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_GRACE_PERIOD_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+class DockerBackend:
+    """Docker container sandboxed execution backend."""
+
+    def __init__(self, image: str = "python:3.12-slim", network_disabled: bool = False) -> None:
+        self.image = image
+        self.network_disabled = network_disabled
+
+    async def run(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        docker_args = ["docker", "run", "--rm", "-i", "-v", f"{cwd}:/workspace", "-w", "/workspace"]
+        if self.network_disabled:
+            docker_args.extend(["--network", "none"])
+
+        for k, v in env.items():
+            docker_args.extend(["-e", f"{k}={v}"])
+
+        docker_args.append(self.image)
+        docker_args.extend(["sh", "-c", command])
+
+        process = await asyncio.create_subprocess_exec(
+            *docker_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            stdout_b, stderr_b = b"", b"Docker execution timed out"
+        except asyncio.CancelledError:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            raise
+
+        stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+        exit_code = process.returncode if not timed_out else None
+
+        return exit_code, stdout, stderr, timed_out
+
+
 class CommandRunner:
     """Runs shell commands asynchronously, safely and with a timeout."""
 
@@ -63,6 +221,7 @@ class CommandRunner:
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         scrub_env: bool = True,
         env: Mapping[str, str] | None = None,
+        backend: ExecutionBackend | None = None,
     ) -> None:
         self.root = Path(project_root).expanduser().resolve()
         self.timeout = max(1, int(timeout))
@@ -70,6 +229,7 @@ class CommandRunner:
         self.max_output_bytes = max_output_bytes
         self.scrub_env = scrub_env
         self._base_env = dict(env) if env is not None else None
+        self.backend = backend or LocalBackend()
 
     # -- Public API ------------------------------------------------------
 
@@ -104,14 +264,9 @@ class CommandRunner:
         approved: bool = False,
         check_safety: bool = True,
     ) -> RunResult:
-        """Execute ``command`` and capture its result.
-
-        Never raises for command failures — a non-zero exit, a timeout or a
-        policy block are all reported through the returned
-        :class:`RunResult`. Only genuinely unexpected OS errors propagate.
-        """
+        """Execute ``command`` and capture its result."""
         command = (command or "").strip()
-        effective_timeout = self.timeout if timeout is None else max(1, int(timeout))
+        effective_timeout = float(self.timeout if timeout is None else max(1, int(timeout)))
 
         if check_safety:
             verdict = self.safety.check_command(command)
@@ -122,8 +277,6 @@ class CommandRunner:
                     blocked=True,
                     reason=verdict.reason or "blocked by safety policy",
                 )
-            # `allowed` means "permitted in principle"; approval is the
-            # separate gate that decides whether it runs unattended.
             if verdict.requires_approval and not approved:
                 return RunResult(
                     command=command,
@@ -135,23 +288,9 @@ class CommandRunner:
         workdir = self.resolve_cwd(cwd)
         started = time.perf_counter()
 
-        popen_kwargs: dict[str, object] = {}
-        if os.name == "posix":
-            # New session => the child gets its own process group, so a timeout
-            # can kill the whole tree instead of just the shell.
-            popen_kwargs["start_new_session"] = True
-
-        shell = _find_shell()
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(workdir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                executable=shell,
-                env=self.build_env(),
-                **popen_kwargs,  # type: ignore[arg-type]
+            exit_code, raw_stdout, raw_stderr, timed_out = await self.backend.run(
+                command, cwd=workdir, env=self.build_env(), timeout=effective_timeout
             )
         except (OSError, ValueError) as exc:
             return RunResult(
@@ -163,27 +302,13 @@ class CommandRunner:
                 reason=f"could not start command: {exc}",
             )
 
-        timed_out = False
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                process.communicate(), timeout=effective_timeout
-            )
-        except asyncio.TimeoutError:
-            timed_out = True
-            await self._terminate(process)
-            stdout_b, stderr_b = await self._drain(process)
-        except asyncio.CancelledError:
-            await self._terminate(process)
-            raise
-
         duration_ms = int((time.perf_counter() - started) * 1000)
-        stdout = _truncate(self._decode(stdout_b), self.max_output_bytes)
-        stderr = _truncate(self._decode(stderr_b), self.max_output_bytes)
+        stdout = _truncate(raw_stdout, self.max_output_bytes)
+        stderr = _truncate(raw_stderr, self.max_output_bytes)
 
-        exit_code: int | None = process.returncode
         if timed_out:
-            note = f"command timed out after {effective_timeout}s and was terminated"
-            stderr = f"{stderr}\n{note}".strip()
+            note = f"command timed out after {effective_timeout:.0f}s and was terminated"
+            stderr = f"{stderr}\n{note}".strip() if stderr else note
             exit_code = None
 
         return RunResult(
@@ -194,51 +319,3 @@ class CommandRunner:
             duration_ms=duration_ms,
             timed_out=timed_out,
         )
-
-    @staticmethod
-    def _decode(raw: bytes | None) -> str:
-        if not raw:
-            return ""
-        return raw.decode("utf-8", errors="replace")
-
-    @staticmethod
-    async def _drain(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
-        """Collect whatever output a killed process already produced."""
-        try:
-            return await asyncio.wait_for(process.communicate(), timeout=_GRACE_PERIOD_SECONDS)
-        except (asyncio.TimeoutError, ProcessLookupError, ValueError):
-            return b"", b""
-
-    @staticmethod
-    async def _terminate(process: asyncio.subprocess.Process) -> None:
-        """SIGTERM the process group, then SIGKILL if it refuses to die."""
-        if process.returncode is not None:
-            return
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            else:  # pragma: no cover - Windows only
-                process.terminate()
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                process.terminate()
-            except (ProcessLookupError, OSError):
-                return
-
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_GRACE_PERIOD_SECONDS)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            else:  # pragma: no cover - Windows only
-                process.kill()
-        except (ProcessLookupError, PermissionError, OSError):
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_GRACE_PERIOD_SECONDS)
-        except asyncio.TimeoutError:  # pragma: no cover - extreme edge case
-            pass

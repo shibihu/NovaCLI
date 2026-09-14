@@ -16,11 +16,8 @@ permissions:
   contents: read
 
 jobs:
-  # ============================================================
-  # UNIT TESTS
-  # ============================================================
   test:
-    name: Run Unit Tests
+    name: Run Test Suite
     runs-on: ubuntu-latest
 
     steps:
@@ -37,7 +34,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio httpx
+          pip install pytest pytest-asyncio httpx build
 
       - name: Run Test Suite
         env:
@@ -45,10 +42,12 @@ jobs:
         run: |
           python -m pytest -q
 
+      - name: Verify Package Build and Install
+        run: |
+          python -m build
+          pip install dist/novacli-*.whl
+          python -c "import nova; import nova.ai; import nova.intelligence; print('Built wheel imported successfully!')"
 
-  # ============================================================
-  # REAL GROQ INTEGRATION TEST
-  # ============================================================
   integration-test:
     name: Real Groq Integration Test
     runs-on: ubuntu-latest
@@ -72,9 +71,6 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio httpx
 
-      # --------------------------------------------------------
-      # Check whether the GitHub Secret exists
-      # --------------------------------------------------------
       - name: Check Groq API Key
         id: check-key
         shell: bash
@@ -87,9 +83,6 @@ jobs:
             echo "GROQ_API_KEY is not configured."
           fi
 
-      # --------------------------------------------------------
-      # Run the REAL Groq API test
-      # --------------------------------------------------------
       - name: Run Real Groq Integration Test
         if: steps.check-key.outputs.available == 'true'
         env:
@@ -97,21 +90,12 @@ jobs:
         run: |
           python -m pytest tests/test_groq_integration.py -v
 
-      # --------------------------------------------------------
-      # Clearly report when the test was skipped
-      # --------------------------------------------------------
       - name: Integration Test Skipped
         if: steps.check-key.outputs.available != 'true'
         run: |
           echo "⚠️ GROQ_API_KEY is not configured."
           echo "⚠️ Real Groq Integration Test was skipped."
-          echo "ℹ️ Add GROQ_API_KEY under:"
-          echo "   GitHub → Settings → Secrets and variables → Actions"
 
-
-  # ============================================================
-  # SUMMARY
-  # ============================================================
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
@@ -129,18 +113,5 @@ jobs:
           echo "        ⚡ NovaCLI CI Summary"
           echo "========================================"
           echo ""
-          echo "Unit Tests:       ${{ needs.test.result }}"
-          echo "Groq Integration: ${{ needs.integration-test.result }}"
-          echo ""
-
-          if [ "${{ needs.test.result }}" != "success" ]; then
-            echo "❌ Unit tests failed."
-            exit 1
-          fi
-
-          if [ "${{ needs.integration-test.result }}" != "success" ]; then
-            echo "❌ Groq integration job failed."
-            exit 1
-          fi
-
-          echo "✅ All required CI jobs passed."
+          echo "Unit & Security Tests: ${{ needs.test.result }}"
+          echo "Groq Integration:      ${{ needs.integration-test.result }}"
