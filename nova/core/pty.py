@@ -92,9 +92,13 @@ class PTYSession:
         fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
         # Spawn child shell attached to slave PTY
+        shell_cmd = [self.shell_path]
+        if self.shell_path.endswith(("bash", "sh", "zsh")) and "-i" not in shell_cmd:
+            shell_cmd.append("-i")
+
         try:
             self.process = subprocess.Popen(
-                [self.shell_path],
+                shell_cmd,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
