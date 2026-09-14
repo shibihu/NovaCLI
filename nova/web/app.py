@@ -23,8 +23,9 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     server starts (so the UI can show setup instructions) and the error
     surfaces when a task is submitted.
     """
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
 
     from nova import __version__
@@ -45,6 +46,67 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     app.state.settings = settings
     app.state.registry = SessionRegistry()
     app.state.version = __version__
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
+            )
+
+        path = request.url.path
+        if (
+            path in {"/", "/api/health", "/api/docs", "/api/openapi.json"}
+            or path.startswith("/static/")
+            or path == "/static"
+        ):
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            current_settings = getattr(app.state, "settings", None)
+            web_token = current_settings.web_token if current_settings else None
+
+            client_host = request.client.host if request.client else "127.0.0.1"
+            is_localhost = client_host in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+                "testclient",
+            }
+
+            if web_token or not is_localhost:
+                provided_token = None
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    provided_token = auth_header[7:].strip()
+                if not provided_token:
+                    provided_token = request.headers.get("X-Nova-Web-Token")
+                if not provided_token:
+                    provided_token = request.query_params.get("token")
+
+                if not web_token and not is_localhost:
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "detail": (
+                                "Authentication token required for non-localhost access. "
+                                "Set NOVA_WEB_TOKEN environment variable."
+                            )
+                        },
+                    )
+
+                if not provided_token or provided_token != web_token:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid or missing authentication token."},
+                    )
+
+        return await call_next(request)
 
     # Local single-user tool: permissive CORS keeps the phone browser happy
     # when the IDE is reached over a LAN address or a Termux port-forward.

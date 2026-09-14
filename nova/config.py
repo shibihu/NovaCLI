@@ -268,6 +268,8 @@ class Settings:
     api_key_source: str = "none"
     web_token: str | None = None
     reasoning_effort: str | None = None
+    execution_backend: str = "local"
+    docker_image: str = "python:3.12-slim"
     extra_ignore: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
 
@@ -359,6 +361,8 @@ class Settings:
             "api_key_source": self.api_key_source,
             "has_web_token": self.has_web_token,
             "reasoning_effort": self.reasoning_effort,
+            "execution_backend": self.execution_backend,
+            "docker_image": self.docker_image,
         }
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -528,6 +532,8 @@ def load_settings(
         api_key_source=key_source,
         web_token=web_token,
         reasoning_effort=reasoning_effort,
+        execution_backend=layered("NOVA_EXECUTION_BACKEND") or "local",
+        docker_image=layered("NOVA_DOCKER_IMAGE") or "python:3.12-slim",
         environment=dict(environ),
     )
 
