@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
-from nova.core.pty import PTYManager, PTYSession
+from nova.core.pty import PTYManager
 
 logger = logging.getLogger(__name__)
 

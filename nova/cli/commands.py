@@ -688,6 +688,23 @@ def cmd_doctor(args: argparse.Namespace, console: Console) -> int:
     else:
         console.warn("no POSIX shell found — command execution disabled")
 
+    # Diagnose PTY backend for interactive terminal
+    try:
+        from nova.core.pty import get_pty_backend_info
+        pty_info = get_pty_backend_info()
+        
+        if pty_info.get("pty_status") == "Available":
+            backend = pty_info.get("backend", "unknown")
+            shell_path = pty_info.get("shell", "not detected")
+            console.ok(f"terminal PTY: {backend}")
+            console.write(f"    shell: {shell_path}")
+        else:
+            error_msg = pty_info.get("pty_error", "unknown error")
+            console.warn(f"terminal PTY unavailable: {error_msg}")
+            failures += 1
+    except Exception as e:
+        console.warn(f"could not diagnose PTY backend: {e}")
+
     console.write()
     if failures:
         console.warn(f"{failures} issue(s) need attention.")

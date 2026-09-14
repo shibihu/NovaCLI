@@ -258,7 +258,15 @@ Global options apply to every subcommand:
 
 ## Interactive PTY Web Terminal
 
-NovaCLI features a **Full Interactive PTY Web Terminal** in the Web IDE.
+NovaCLI features a **Full Interactive PTY Web Terminal** with cross-platform support in the Web IDE.
+
+### Supported Platforms
+
+- **Linux** (Debian, Ubuntu, Fedora, etc.) — Unix PTY backend
+- **macOS / Darwin** — Unix PTY backend  
+- **WSL** (Windows Subsystem for Linux) — Unix PTY backend
+- **Termux / Android** — Unix PTY backend
+- **Windows** (Windows 10 build 17763+) — Windows ConPTY backend
 
 ### Architecture
 
@@ -270,10 +278,19 @@ NovaCLI supports two distinct command execution paths:
 
 2. **Interactive PTY Terminal (`/ws/terminal`)**:
    - Connects browser to a real OS Pseudo-Terminal (PTY) over WebSocket using [xterm.js](https://xtermjs.org/).
+
+   **On Linux, WSL, and Termux:**
    - Spawns an interactive shell (`/bin/bash`, `/usr/bin/bash`, or `/bin/sh`) attached to a POSIX PTY master/slave pair (`openpty`).
    - Supports interactive TTY applications: `python`, `nano`, `vim`, `bash`, `top`, `htop`, `less`, `watch`.
    - Interprets ANSI escape sequences so `clear` and terminal colors render cleanly.
    - Synchronizes browser terminal dimensions with the OS PTY via `TIOCSWINSZ` ioctl (`stty size`).
+
+   **On Windows:**
+   - Uses Windows ConPTY (Windows 10+ pseudo-console API) for true terminal emulation.
+   - Spawns an interactive shell (default: `cmd.exe`, configurable via `NOVA_TERMINAL_SHELL`).
+   - Supports interactive applications like `python`, `powershell`, batch scripts.
+   - Synchronizes browser terminal dimensions with ConPTY via `ResizePseudoConsole` API.
+   - Can use `powershell.exe` or `pwsh.exe` if configured: `NOVA_TERMINAL_SHELL=powershell.exe`.
 
 ### WebSocket Protocol
 
@@ -298,6 +315,26 @@ NovaCLI supports two distinct command execution paths:
 Designed for mobile devices (phones/tablets and Termux/Android):
 - Touch-friendly layout with mobile quick control bar (`Ctrl`, `Esc`, `Tab`, `↑`, `↓`, `←`, `→`).
 - Auto-fits terminal dimensions to device screen or orientation changes.
+
+### Diagnostics
+
+Check your terminal backend:
+
+```bash
+nova doctor
+```
+
+Example output on Windows:
+```
+terminal PTY: Windows ConPTY
+    shell: C:\Windows\System32\cmd.exe
+```
+
+Example output on Linux:
+```
+terminal PTY: Unix PTY
+    shell: /bin/bash
+```
 
 > **Security Warning**:
 > An interactive local PTY executes commands with the privileges of the NovaCLI host environment. It provides direct shell access to the workspace directory and should be treated as a local terminal, not an isolated security sandbox.
