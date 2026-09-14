@@ -153,11 +153,29 @@ class LocalBackend:
 
 
 class DockerBackend:
-    """Docker container sandboxed execution backend."""
+    """Docker container sandboxed execution backend.
 
-    def __init__(self, image: str = "python:3.12-slim", network_disabled: bool = False) -> None:
+    Applies security restrictions (cap-drop, no-new-privileges, resource limits,
+    tmpfs mounts) and ensures container termination on timeout.
+    """
+
+    def __init__(
+        self,
+        image: str = "python:3.12-slim",
+        network_disabled: bool = False,
+        cap_drop_all: bool = True,
+        no_new_privileges: bool = True,
+        pids_limit: int = 256,
+        memory_limit: str | None = "512m",
+        cpu_limit: str | None = "1.5",
+    ) -> None:
         self.image = image
         self.network_disabled = network_disabled
+        self.cap_drop_all = cap_drop_all
+        self.no_new_privileges = no_new_privileges
+        self.pids_limit = pids_limit
+        self.memory_limit = memory_limit
+        self.cpu_limit = cpu_limit
 
     async def run(
         self,
@@ -166,7 +184,28 @@ class DockerBackend:
         env: dict[str, str],
         timeout: float,
     ) -> tuple[int | None, str, str, bool]:
-        docker_args = ["docker", "run", "--rm", "-i", "-v", f"{cwd}:/workspace", "-w", "/workspace"]
+        import uuid
+        container_name = f"nova_sandbox_{uuid.uuid4().hex[:12]}"
+
+        docker_args = [
+            "docker", "run",
+            "--name", container_name,
+            "--rm", "-i",
+            "-v", f"{cwd}:/workspace",
+            "-w", "/workspace",
+            "--tmpfs", "/tmp:exec,mode=1777",
+        ]
+
+        if self.cap_drop_all:
+            docker_args.extend(["--cap-drop", "ALL"])
+        if self.no_new_privileges:
+            docker_args.extend(["--security-opt", "no-new-privileges"])
+        if self.pids_limit:
+            docker_args.extend(["--pids-limit", str(self.pids_limit)])
+        if self.memory_limit:
+            docker_args.extend(["--memory", str(self.memory_limit)])
+        if self.cpu_limit:
+            docker_args.extend(["--cpus", str(self.cpu_limit)])
         if self.network_disabled:
             docker_args.extend(["--network", "none"])
 
@@ -190,16 +229,10 @@ class DockerBackend:
             )
         except asyncio.TimeoutError:
             timed_out = True
-            try:
-                process.terminate()
-            except Exception:
-                pass
+            await self._cleanup_container(container_name, process)
             stdout_b, stderr_b = b"", b"Docker execution timed out"
         except asyncio.CancelledError:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+            await self._cleanup_container(container_name, process)
             raise
 
         stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
@@ -207,6 +240,24 @@ class DockerBackend:
         exit_code = process.returncode if not timed_out else None
 
         return exit_code, stdout, stderr, timed_out
+
+    @staticmethod
+    async def _cleanup_container(container_name: str, process: asyncio.subprocess.Process) -> None:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+        # Force kill container via docker CLI to prevent orphaned processes
+        try:
+            kill_proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(kill_proc.wait(), timeout=5.0)
+        except Exception:
+            pass
 
 
 class CommandRunner:

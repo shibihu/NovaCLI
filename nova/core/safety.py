@@ -456,7 +456,8 @@ class SafetyPolicy:
     # -- Internals -------------------------------------------------------
 
     def _resolve(self, path: str | Path) -> Path:
-        candidate = Path(path).expanduser()
+        raw = str(path).replace("\\", "/")
+        candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = self.root / candidate
         return candidate.resolve()

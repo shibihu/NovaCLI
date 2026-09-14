@@ -81,6 +81,8 @@ class OllamaProvider:
             msg: dict[str, Any] = {"role": str(m.get("role", "user"))}
             if "content" in m and m["content"] is not None:
                 msg["content"] = str(m["content"])
+            elif m.get("role") == "assistant" and "tool_calls" in m:
+                msg["content"] = ""
             if "tool_calls" in m and m["tool_calls"] is not None:
                 norm_tool_calls = []
                 for tc in m["tool_calls"]:
