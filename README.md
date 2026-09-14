@@ -302,6 +302,27 @@ Full unit, integration, and regression test suite covering native tool calling, 
 
 ---
 
+---
+
+## Execution Backends & Security Model
+
+NovaCLI supports two command execution backends:
+
+1. **Local Host Execution (`LocalBackend`)**:
+   - Executes commands directly on the host machine.
+   - Guarded by `SafetyPolicy` path and command checks, process-group timeouts, environment secret scrubbing, and interactive human approval for risky operations.
+
+2. **Docker Isolation (`DockerBackend`)**:
+   - Optional sandboxed execution inside a Docker container.
+   - Applies container safety flags: `--cap-drop=ALL`, `--security-opt=no-new-privileges`, memory/CPU limits (`--memory 512m`, `--cpus 1.5`), `--pids-limit 256`, and isolated `/tmp` tmpfs.
+   - Automatically terminates hanging containers on command timeout to prevent orphaned processes.
+
+> **Security Threat Model & Limitations**:
+> `SafetyPolicy` provides application-level policy enforcement and credential filtering. It is not an unbreakable OS sandbox.
+> Optional Docker isolation adds container-level confinement, but workspace files remain mounted for tool usability.
+
+---
+
 ## License
 
 MIT
