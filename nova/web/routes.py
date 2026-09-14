@@ -127,6 +127,16 @@ async def index(request: Request) -> HTMLResponse:
 
 
 # ---------------------------------------------------------------------------
+
+@router.get("/api/terminal/diagnostics")
+async def terminal_diagnostics(request: Request) -> dict[str, Any]:
+    """Return safe, secret-scrubbed diagnostics for terminal environment and command resolution."""
+    from nova.core.pty import get_terminal_diagnostics
+    settings = _settings(request)
+    env = dict(settings.environment) if hasattr(settings, "environment") and settings.environment else None
+    return get_terminal_diagnostics(cwd=str(settings.project_root), env=env)
+
+
 # Status
 # ---------------------------------------------------------------------------
 

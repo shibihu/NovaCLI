@@ -66,10 +66,18 @@ class PTYSession(PTYSessionBase):
         self.shell_path = shell_path or _find_default_shell()
 
         # Build secret-scrubbed environment
-        base_env = dict(env if env is not None else os.environ)
-        for key in list(base_env):
-            if key in SCRUBBED_ENV_KEYS or key.startswith("NOVA_SECRET"):
-                base_env.pop(key, None)
+        base_env = dict(os.environ)
+        if env is not None:
+            base_env.update(env)
+
+        scrubbed_upper = {k.upper() for k in SCRUBBED_ENV_KEYS}
+        keys_to_remove = [
+            k for k in base_env
+            if k.upper() in scrubbed_upper or k.upper().startswith("NOVA_SECRET")
+        ]
+        for key in keys_to_remove:
+            base_env.pop(key, None)
+
         base_env.update(
             {
                 "TERM": "xterm-256color",
