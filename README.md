@@ -254,6 +254,56 @@ Global options apply to every subcommand:
 
 ---
 
+---
+
+## Interactive PTY Web Terminal
+
+NovaCLI features a **Full Interactive PTY Web Terminal** in the Web IDE.
+
+### Architecture
+
+NovaCLI supports two distinct command execution paths:
+
+1. **Non-Interactive Execution (`POST /api/run`)**:
+   - Executes single commands via `CommandRunner` with `LocalBackend` or `DockerBackend`.
+   - Ideal for script runs (`pytest`, `git status`, `pip install`).
+
+2. **Interactive PTY Terminal (`/ws/terminal`)**:
+   - Connects browser to a real OS Pseudo-Terminal (PTY) over WebSocket using [xterm.js](https://xtermjs.org/).
+   - Spawns an interactive shell (`/bin/bash`, `/usr/bin/bash`, or `/bin/sh`) attached to a POSIX PTY master/slave pair (`openpty`).
+   - Supports interactive TTY applications: `python`, `nano`, `vim`, `bash`, `top`, `htop`, `less`, `watch`.
+   - Interprets ANSI escape sequences so `clear` and terminal colors render cleanly.
+   - Synchronizes browser terminal dimensions with the OS PTY via `TIOCSWINSZ` ioctl (`stty size`).
+
+### WebSocket Protocol
+
+- **Endpoint**: `/ws/terminal`
+- **Authentication**: Protected by NovaCLI's Web API token (`Authorization: Bearer <token>` or `X-Nova-Web-Token: <token>`).
+
+**Client -> Server Messages:**
+```json
+{"type": "input", "data": "ls -la\n"}
+{"type": "resize", "cols": 120, "rows": 30}
+```
+
+**Server -> Client Messages:**
+```json
+{"type": "output", "data": "..."}
+{"type": "exit", "code": 0}
+{"type": "error", "message": "..."}
+```
+
+### Mobile UI & Keyboards
+
+Designed for mobile devices (phones/tablets and Termux/Android):
+- Touch-friendly layout with mobile quick control bar (`Ctrl`, `Esc`, `Tab`, `↑`, `↓`, `←`, `→`).
+- Auto-fits terminal dimensions to device screen or orientation changes.
+
+> **Security Warning**:
+> An interactive local PTY executes commands with the privileges of the NovaCLI host environment. It provides direct shell access to the workspace directory and should be treated as a local terminal, not an isolated security sandbox.
+
+---
+
 ## Web IDE
 
 ```bash

@@ -146,9 +146,8 @@ def test_file_editor_controls_exist(html: str) -> None:
 
 
 def test_terminal_controls_exist(html: str) -> None:
-    assert 'id="term-form"' in html
-    assert 'id="term-input"' in html
-    assert 'id="terminal-out"' in html
+    assert 'id="terminal-container"' in html
+    assert 'mobile-term-controls' in html
 
 
 def test_project_panel_exists(html: str) -> None:

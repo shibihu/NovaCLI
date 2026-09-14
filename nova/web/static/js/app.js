@@ -78,6 +78,7 @@
       tab.setAttribute("aria-selected", String(active));
     });
     if (name === "files") loadFiles(filesPath);
+    if (name === "term") initTerminal();
     if (name === "project") loadProject();
   }
 
@@ -423,59 +424,158 @@
     }
   });
 
-  // --- Terminal ---------------------------------------------------------
+  // --- Interactive PTY Terminal (xterm.js + WebSocket) -------------------
 
-  function termWrite(html) {
-    const out = $("terminal-out");
-    const node = document.createElement("div");
-    node.innerHTML = html;
-    out.appendChild(node);
-    out.scrollTop = out.scrollHeight;
+  let termInstance = null;
+  let fitAddon = null;
+  let termWs = null;
+  let ctrlActive = false;
+
+  function initTerminal() {
+    const container = $("terminal-container");
+    if (!container) return;
+
+    if (!termInstance && typeof Terminal !== "undefined") {
+      termInstance = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+        theme: {
+          background: "#0d1117",
+          foreground: "#c9d1d9",
+          cursor: "#58a6ff",
+        },
+        convertEol: true,
+      });
+
+      if (typeof FitAddon !== "undefined" && FitAddon.FitAddon) {
+        fitAddon = new FitAddon.FitAddon();
+        termInstance.loadAddon(fitAddon);
+      }
+
+      termInstance.open(container);
+      if (fitAddon) fitAddon.fit();
+
+      connectTerminalWs();
+
+      termInstance.onData((data) => {
+        if (ctrlActive && data.length === 1) {
+          ctrlActive = false;
+          const ctrlBtn = $("term-ctrl-btn");
+          if (ctrlBtn) ctrlBtn.classList.remove("is-active");
+          const code = data.toUpperCase().charCodeAt(0);
+          if (code >= 64 && code <= 95) {
+            data = String.fromCharCode(code - 64);
+          }
+        }
+        sendTermMsg({ type: "input", data: data });
+      });
+
+      termInstance.onResize((size) => {
+        sendTermMsg({ type: "resize", cols: size.cols, rows: size.rows });
+      });
+
+      window.addEventListener("resize", () => {
+        if (fitAddon && termInstance) {
+          fitAddon.fit();
+        }
+      });
+    } else if (fitAddon && termInstance) {
+      setTimeout(() => fitAddon.fit(), 50);
+    }
   }
 
+  function connectTerminalWs() {
+    if (termWs && (termWs.readyState === WebSocket.OPEN || termWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const cols = termInstance ? termInstance.cols : 80;
+    const rows = termInstance ? termInstance.rows : 24;
+    const wsUrl = protocol + "//" + location.host + "/ws/terminal?cols=" + cols + "&rows=" + rows;
+
+    try {
+      termWs = new WebSocket(wsUrl);
+
+      termWs.onopen = () => {
+        if (fitAddon && termInstance) fitAddon.fit();
+      };
+
+      termWs.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "output" && termInstance) {
+            termInstance.write(msg.data);
+          } else if (msg.type === "exit" && termInstance) {
+            termInstance.write("\r\n\x1b[33m[Process exited with code " + msg.code + "]\x1b[0m\r\n");
+          } else if (msg.type === "error" && termInstance) {
+            termInstance.write("\r\n\x1b[31m[Error: " + esc(msg.message) + "]\x1b[0m\r\n");
+          }
+        } catch (e) {
+          if (termInstance) termInstance.write(event.data);
+        }
+      };
+
+      termWs.onclose = () => {
+        if (termInstance) {
+          termInstance.write("\r\n\x1b[33m[Terminal disconnected. Switch tab or refresh to reconnect.]\x1b[0m\r\n");
+        }
+        termWs = null;
+      };
+    } catch (err) {
+      if (termInstance) termInstance.write("\r\n\x1b[31m[WebSocket connection failed: " + err.message + "]\x1b[0m\r\n");
+    }
+  }
+
+  function sendTermMsg(msg) {
+    if (termWs && termWs.readyState === WebSocket.OPEN) {
+      termWs.send(JSON.stringify(msg));
+    }
+  }
+
+  // Mobile quick control buttons
+  document.querySelectorAll(".mobile-term-controls .btn-term").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const key = btn.dataset.key;
+      if (!key) return;
+
+      if (key === "Ctrl") {
+        ctrlActive = !ctrlActive;
+        btn.classList.toggle("is-active", ctrlActive);
+        if (termInstance) termInstance.focus();
+        return;
+      }
+
+      let data = "";
+      if (key === "Esc") data = "\x1b";
+      else if (key === "Tab") data = "\t";
+      else if (key === "Up") data = "\x1b[A";
+      else if (key === "Down") data = "\x1b[B";
+      else if (key === "Right") data = "\x1b[C";
+      else if (key === "Left") data = "\x1b[D";
+
+      if (data) {
+        sendTermMsg({ type: "input", data: data });
+        if (termInstance) termInstance.focus();
+      }
+    });
+  });
+
+  // Preserve non-interactive command execution API helper for external/CLI callers
   async function runCommand(command, approve) {
-    termWrite('<span class="cmd">$ ' + esc(command) + "</span>");
     try {
       const data = await api("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: command, approve: Boolean(approve) }),
       });
-
-      if (data.requires_approval) {
-        termWrite('<span class="meta">⚠ needs approval (' + esc(data.reason || "") + ")</span>");
-        if (window.confirm("This command needs approval:\n\n" + command + "\n\nRun it?")) {
-          return runCommand(command, true);
-        }
-        termWrite('<span class="meta">cancelled</span>');
-        return;
-      }
-
-      const result = data.result || {};
-      if (result.stdout) termWrite(esc(result.stdout));
-      if (result.stderr) termWrite('<span class="err">' + esc(result.stderr) + "</span>");
-      termWrite(
-        '<span class="meta">[exit ' +
-          esc(result.exit_code) +
-          " · " +
-          esc(result.duration_ms) +
-          "ms" +
-          (result.timed_out ? " · TIMEOUT" : "") +
-          "]</span>"
-      );
+      return data;
     } catch (error) {
-      termWrite('<span class="err">' + esc(error.message) + "</span>");
+      throw error;
     }
   }
-
-  $("term-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const input = $("term-input");
-    const command = input.value.trim();
-    if (!command) return;
-    input.value = "";
-    runCommand(command, false);
-  });
 
   // --- Project ----------------------------------------------------------
 

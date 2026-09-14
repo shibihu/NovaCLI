@@ -47,7 +47,7 @@ nova = "nova.cli.commands:main"
 include = ["nova*"]
 
 [tool.setuptools.package-data]
-"nova.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js"]
+"nova.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/vendor/xterm/*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
