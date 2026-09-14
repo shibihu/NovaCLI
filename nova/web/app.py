@@ -86,7 +86,8 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
                     provided_token = auth_header[7:].strip()
                 if not provided_token:
                     provided_token = request.headers.get("X-Nova-Web-Token")
-                if not provided_token:
+                # Query-string token parameter is deprecated for REST APIs and allowed only for EventSource streams
+                if not provided_token and path == "/api/agent/stream":
                     provided_token = request.query_params.get("token")
 
                 if not web_token and not is_localhost:

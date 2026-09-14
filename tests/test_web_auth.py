@@ -56,9 +56,10 @@ def test_api_endpoint_allows_valid_x_header_token(client):
     assert resp.status_code == 200
 
 
-def test_api_endpoint_allows_valid_query_param_token(client):
+def test_rest_api_endpoint_rejects_query_param_token(client):
+    # Query string tokens are deprecated and disabled for REST APIs
     resp = client.get(f"/api/config?token={SECRET_TOKEN}")
-    assert resp.status_code == 200
+    assert resp.status_code == 401
 
 
 def test_sse_endpoint_protected(client):

@@ -383,3 +383,45 @@ async def test_groq_tool_loop_still_works():
     # Verify Groq provider tool calling interface remains functional
     groq_provider = GroqProvider("gsk_fake_key_12345678901234567890")
     assert groq_provider.model_name == "openai/gpt-oss-20b"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_arguments_fails_safely(tmp_path: Path):
+    turn = 0
+
+    def mock_transport(request: httpx.Request) -> httpx.Response:
+        nonlocal turn
+        turn += 1
+        if turn == 1:
+            payload = {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c_bad",
+                                    "function": {
+                                        "name": "run_command",
+                                        "arguments": "{invalid_json: ",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        else:
+            data = json.loads(request.content)
+            tool_msg = data["messages"][-1]
+            assert "parsing failed" in tool_msg["content"].lower() or "invalid" in tool_msg["content"].lower()
+            payload = {"choices": [{"message": {"content": "Failed to parse arguments."}}]}
+        return httpx.Response(200, json=payload)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock_transport))
+    provider = OllamaProvider(base_url="http://localhost:11434", client=client)
+    settings = load_settings(project_root=tmp_path, env={"NOVA_PROVIDER": "ollama"})
+    agent = NovaAgent(provider=provider, settings=settings)
+
+    result = await agent.run("run command")
+    assert result.ok is True
+    assert "Failed to parse" in result.answer

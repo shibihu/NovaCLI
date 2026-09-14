@@ -163,6 +163,7 @@ class DockerBackend:
         self,
         image: str = "python:3.12-slim",
         network_disabled: bool = False,
+        read_only: bool = True,
         cap_drop_all: bool = True,
         no_new_privileges: bool = True,
         pids_limit: int = 256,
@@ -171,6 +172,7 @@ class DockerBackend:
     ) -> None:
         self.image = image
         self.network_disabled = network_disabled
+        self.read_only = read_only
         self.cap_drop_all = cap_drop_all
         self.no_new_privileges = no_new_privileges
         self.pids_limit = pids_limit
@@ -195,6 +197,9 @@ class DockerBackend:
             "-w", "/workspace",
             "--tmpfs", "/tmp:exec,mode=1777",
         ]
+
+        if self.read_only:
+            docker_args.append("--read-only")
 
         if self.cap_drop_all:
             docker_args.extend(["--cap-drop", "ALL"])

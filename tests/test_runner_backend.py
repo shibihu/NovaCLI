@@ -56,6 +56,7 @@ async def test_docker_backend_constructs_cmd_with_security_flags(tmp_path: Path)
     docker_backend = DockerBackend(
         image="python:3.12-slim",
         network_disabled=True,
+        read_only=True,
         cap_drop_all=True,
         no_new_privileges=True,
         memory_limit="256m",
@@ -86,6 +87,7 @@ async def test_docker_backend_constructs_cmd_with_security_flags(tmp_path: Path)
         assert "256m" in args
         assert "--cpus" in args
         assert "1.0" in args
+        assert "--read-only" in args
         assert "--network" in args
         assert "none" in args
         assert "python:3.12-slim" in args

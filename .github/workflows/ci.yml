@@ -97,7 +97,7 @@ jobs:
           echo "⚠️ Real Groq Integration Test was skipped."
 
   ci-summary:
-    name: CI Summary
+    name: CI Summary Gate
     runs-on: ubuntu-latest
     needs:
       - test
@@ -106,7 +106,7 @@ jobs:
     if: always()
 
     steps:
-      - name: Show CI Result
+      - name: Evaluate CI Gate Status
         shell: bash
         run: |
           echo "========================================"
@@ -115,3 +115,16 @@ jobs:
           echo ""
           echo "Unit & Security Tests: ${{ needs.test.result }}"
           echo "Groq Integration:      ${{ needs.integration-test.result }}"
+          echo ""
+          python3 -c "
+import sys
+test_res = '${{ needs.test.result }}'
+groq_res = '${{ needs.integration-test.result }}'
+if test_res != 'success':
+    print('❌ Required job test failed or was cancelled.')
+    sys.exit(1)
+if groq_res == 'failure':
+    print('❌ integration-test failed.')
+    sys.exit(1)
+print('✅ All required CI checks passed.')
+"
