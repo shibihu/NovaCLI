@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes as wintypes
-import io
+import collections
 import logging
 import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Mapping
 
@@ -20,15 +19,6 @@ logger = logging.getLogger(__name__)
 
 # Windows API constants
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
-
-# Handle ctypes
-kernel32 = ctypes.windll.kernel32
-
-
-class COORD(ctypes.Structure):
-    """Console coordinate structure."""
-    _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
 
 
 def _find_shell() -> str:
@@ -64,9 +54,8 @@ def _find_shell() -> str:
 class PTYSession(PTYSessionBase):
     """Windows ConPTY session managing one interactive shell process.
     
-    This implementation uses subprocess with pipe-based I/O rather than
-    the low-level ConPTY API, which provides better compatibility and
-    simpler handle management.
+    This implementation uses subprocess with pipe-based I/O and a background
+    reader thread to collect output. A thread-safe deque buffers output data.
     """
 
     def __init__(
@@ -98,9 +87,10 @@ class PTYSession(PTYSessionBase):
         )
         self.env = base_env
 
-        # Initialize output buffer
-        self.output_buffer = io.BytesIO()
+        # Output buffer using thread-safe deque
+        self.output_buffer = collections.deque(maxlen=10000)  # Keep last 10000 chunks
         self.output_lock = threading.Lock()
+        self.reader_thread = None
 
         # Spawn shell with pipes
         self._create_pty()
@@ -123,17 +113,20 @@ class PTYSession(PTYSessionBase):
             self._pid = self.process.pid
 
             # Start background thread to read process output
-            self._reader_thread = threading.Thread(
+            self.reader_thread = threading.Thread(
                 target=self._reader_thread_func, daemon=True
             )
-            self._reader_thread.start()
+            self.reader_thread.start()
+            
+            # Give the reader thread a moment to start
+            time.sleep(0.05)
 
         except Exception as e:
             logger.error(f"Windows PTY initialization failed: {e}")
             raise
 
     def _reader_thread_func(self) -> None:
-        """Background thread that reads process output and stores it in buffer."""
+        """Background thread that reads process output and buffers it."""
         if not self.process or not self.process.stdout:
             return
 
@@ -143,11 +136,23 @@ class PTYSession(PTYSessionBase):
                     chunk = self.process.stdout.read(4096)
                     if chunk:
                         with self.output_lock:
-                            self.output_buffer.write(chunk)
+                            # Add chunk to deque (automatically evicts oldest if full)
+                            self.output_buffer.append(chunk)
                     else:
-                        break
+                        # Empty read, small sleep to avoid busy loop
+                        time.sleep(0.01)
                 except (IOError, OSError):
                     break
+            
+            # Final read for any remaining output
+            try:
+                remaining = self.process.stdout.read()
+                if remaining:
+                    with self.output_lock:
+                        self.output_buffer.append(remaining)
+            except Exception:
+                pass
+                
         except Exception as e:
             logger.debug(f"Reader thread error: {e}")
 
@@ -175,9 +180,8 @@ class PTYSession(PTYSessionBase):
     def resize(self, cols: int, rows: int) -> None:
         """Resize the terminal window dimensions.
         
-        Note: On Windows, we track the dimensions but cannot actually
-        resize the ConPTY without more complex API calls. This is a
-        limitation of the pipe-based approach.
+        Note: On Windows with pipes, we track dimensions but cannot resize
+        the underlying console. This is a limitation of pipe-based approach.
         """
         if self._closed:
             return
@@ -187,9 +191,6 @@ class PTYSession(PTYSessionBase):
         
         self.cols = cols
         self.rows = rows
-        
-        # On Windows with pipes, we can't easily resize the underlying console
-        logger.debug(f"Terminal resized to {cols}x{rows} (reflected in UI only)")
 
     def write(self, data: bytes | str) -> None:
         """Write user input to the shell's stdin."""
@@ -210,39 +211,22 @@ class PTYSession(PTYSessionBase):
     def read(self, max_bytes: int = 4096) -> bytes:
         """Read available output from the shell.
         
-        This reads from our internal buffer which is filled by the
-        background reader thread.
+        Drains output buffer chunks up to max_bytes.
         """
         if self._closed:
             return b""
 
-        try:
-            with self.output_lock:
-                # Get current buffer position
-                current_pos = self.output_buffer.tell()
-                self.output_buffer.seek(0, 2)  # Seek to end
-                end_pos = self.output_buffer.tell()
-                
-                # If there's no new data, return empty
-                if current_pos >= end_pos:
-                    return b""
-                
-                # Read new data from current position to end
-                self.output_buffer.seek(current_pos)
-                data = self.output_buffer.read(max_bytes)
-                
-                # If we've read all the data, trim the buffer
-                if self.output_buffer.tell() >= end_pos:
-                    # Reset buffer for next read cycle
-                    remaining = self.output_buffer.read()
-                    self.output_buffer = io.BytesIO()
-                    if remaining:
-                        self.output_buffer.write(remaining)
-                
-                return data
-        except Exception as e:
-            logger.debug(f"Windows PTY read error on session {self.id}: {e}")
-            return b""
+        with self.output_lock:
+            if not self.output_buffer:
+                return b""
+            
+            # Collect chunks from buffer up to max_bytes
+            result = b""
+            while self.output_buffer and len(result) < max_bytes:
+                chunk = self.output_buffer.popleft()
+                result += chunk
+            
+            return result
 
     def close(self) -> None:
         """Terminate the shell process and clean up resources."""
@@ -279,4 +263,5 @@ class PTYSession(PTYSessionBase):
 
 
 __all__ = ["PTYSession"]
+
 
