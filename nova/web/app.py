@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
             path in {"/", "/api/health", "/api/docs", "/api/openapi.json"}
             or path.startswith("/static/")
             or path == "/static"
+            or path.startswith("/ws/")
         ):
             return await call_next(request)
 
@@ -122,6 +123,9 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    from nova.web.terminal import router as terminal_router
+
+    app.include_router(terminal_router)
     app.include_router(router)
     register_exception_handlers(app)
     return app

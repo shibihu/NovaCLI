@@ -11,6 +11,9 @@
   <meta name="description" content="NovaCLI — AI-powered developer environment.">
   <title>NovaCLI · {{ project_name }}</title>
   <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+  <script src="/static/vendor/xterm/xterm.js"></script>
+  <script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
 </head>
 <body>
   <!-- Top bar ------------------------------------------------------------ -->
@@ -93,12 +96,16 @@
 
     <!-- Terminal -------------------------------------------------------- -->
     <section class="view" id="view-term" role="tabpanel" aria-label="Terminal">
-      <div class="terminal" id="terminal-out"></div>
-      <form class="composer" id="term-form" autocomplete="off">
-        <label class="sr-only" for="term-input">Command</label>
-        <input id="term-input" name="command" placeholder="pytest -q" spellcheck="false" autocapitalize="off">
-        <button type="submit" class="btn btn-primary">Run</button>
-      </form>
+      <div id="terminal-container" class="terminal-container"></div>
+      <div class="mobile-term-controls">
+        <button type="button" class="btn btn-term" id="term-ctrl-btn" data-key="Ctrl">Ctrl</button>
+        <button type="button" class="btn btn-term" data-key="Esc">Esc</button>
+        <button type="button" class="btn btn-term" data-key="Tab">Tab</button>
+        <button type="button" class="btn btn-term" data-key="Up">↑</button>
+        <button type="button" class="btn btn-term" data-key="Down">↓</button>
+        <button type="button" class="btn btn-term" data-key="Left">←</button>
+        <button type="button" class="btn btn-term" data-key="Right">→</button>
+      </div>
     </section>
 
     <!-- Project --------------------------------------------------------- -->
