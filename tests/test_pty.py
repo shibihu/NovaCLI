@@ -294,3 +294,57 @@ class TestWindowsPTY:
         assert session.is_alive is False
         assert manager.get(session.id) is None
 
+
+
+
+class TestWindowsPtyLogicMocked:
+    """Tests for Windows PTY logic using mocks so they run on any OS (CI)."""
+
+    def test_find_shell_custom_nova_terminal_shell(self, tmp_path: Path):
+        from nova.core.pty.windows import _find_shell
+        dummy_shell = tmp_path / "custom_shell.exe"
+        dummy_shell.write_text("echo dummy")
+
+        env = {"NOVA_TERMINAL_SHELL": str(dummy_shell)}
+        resolved = _find_shell(env)
+        assert resolved == str(dummy_shell)
+
+    def test_find_shell_missing_configured_shell_raises(self):
+        from nova.core.pty.windows import _find_shell
+        env = {"NOVA_TERMINAL_SHELL": r"C:\nonexistent_shell_12345.exe"}
+        with pytest.raises(RuntimeError, match="Configured shell not found"):
+            _find_shell(env)
+
+    def test_find_shell_comspec(self, tmp_path: Path):
+        from nova.core.pty.windows import _find_shell
+        dummy_comspec = tmp_path / "cmd.exe"
+        dummy_comspec.write_text("cmd")
+        env = {"COMSPEC": str(dummy_comspec)}
+        assert _find_shell(env) == str(dummy_comspec)
+
+    def test_pty_environment_inheritance_and_case_insensitive_scrubbing(self, tmp_path: Path):
+        from nova.core.pty.windows import PTYSession as WinPTY
+
+        custom_env = {
+            "PATH": "/usr/bin:/bin",
+            "Path": "/usr/bin:/bin",
+            "groq_api_key": "secret_groq_key",
+            "NOVA_SECRET_TOKEN": "secret_token",
+            "CUSTOM_USER_VAR": "custom_val",
+        }
+
+        def mock_create(self_obj):
+            pass
+
+        old_create = WinPTY._create_pty
+        WinPTY._create_pty = mock_create
+        try:
+            session = WinPTY("test_win_env", tmp_path, shell_path="/bin/sh", env=custom_env)
+            assert "groq_api_key" not in session.env
+            assert "GROQ_API_KEY" not in session.env
+            assert "NOVA_SECRET_TOKEN" not in session.env
+            assert session.env.get("CUSTOM_USER_VAR") == "custom_val"
+            assert session.env.get("PATH") == "/usr/bin:/bin"
+            assert session.cwd == tmp_path.resolve()
+        finally:
+            WinPTY._create_pty = old_create

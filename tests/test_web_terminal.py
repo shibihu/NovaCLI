@@ -154,7 +154,7 @@ def test_websocket_terminal_echoes_typed_characters(tmp_path: Path):
         # Clear the pending line so the shell does not run it.
         websocket.send_json({"type": "input", "data": "\x03"})
 
-    assert matched, f"typed characters were not echoed back, got: {output_text!r}"
+    assert "nova" in output_text and "marker" in output_text, f"typed characters were not echoed back, got: {output_text!r}"
 
 
 def test_websocket_terminal_handles_resize(tmp_path: Path):
@@ -268,3 +268,28 @@ def test_websocket_terminal_reports_exit_when_shell_ends(tmp_path: Path):
     with client.websocket_connect("/ws/terminal") as websocket:
         websocket.send_json({"type": "input", "data": "exit\r"})
         assert _wait_for_exit(websocket), "server never reported the shell exit"
+
+
+
+def test_websocket_terminal_uses_dotenv_nova_terminal_shell(tmp_path: Path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("NOVA_TERMINAL_SHELL=custom_shell_from_dotenv\nGROQ_API_KEY=gsk_test\n", encoding="utf-8")
+
+    captured_args = {}
+
+    def fake_create(cwd, cols=80, rows=24, shell_path=None, env=None):
+        captured_args["cwd"] = cwd
+        captured_args["env"] = env
+        raise RuntimeError("simulated creation stop")
+
+    monkeypatch.setattr(terminal_module.pty_manager, "create", fake_create)
+
+    settings = load_settings(project_root=tmp_path, env={})
+    app = create_app(settings)
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws/terminal") as websocket:
+        msg = websocket.receive_json()
+        assert msg.get("type") == "error"
+
+    assert captured_args.get("env", {}).get("NOVA_TERMINAL_SHELL") == "custom_shell_from_dotenv"

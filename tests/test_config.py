@@ -266,3 +266,21 @@ def test_api_key_hint_mentions_all_sources() -> None:
 def test_settings_is_frozen(settings: Settings) -> None:
     with pytest.raises(Exception):
         settings.groq_model = "mutated"  # type: ignore[misc]
+
+
+
+def test_load_settings_environment_includes_dotenv_and_environ(tmp_path: Path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("NOVA_TERMINAL_SHELL=powershell.exe\nDOTENV_ONLY_VAR=from_dotenv\nOVERRIDDEN_VAR=dotenv_val", encoding="utf-8")
+
+    proc_env = {
+        "OVERRIDDEN_VAR": "proc_val",
+        "PROC_ONLY_VAR": "proc_val_only",
+    }
+
+    settings = load_settings(project_root=tmp_path, env=proc_env)
+
+    assert settings.environment.get("NOVA_TERMINAL_SHELL") == "powershell.exe"
+    assert settings.environment.get("DOTENV_ONLY_VAR") == "from_dotenv"
+    assert settings.environment.get("OVERRIDDEN_VAR") == "proc_val"
+    assert settings.environment.get("PROC_ONLY_VAR") == "proc_val_only"
