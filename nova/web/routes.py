@@ -533,10 +533,10 @@ async def git_status(request: Request) -> dict[str, Any]:
     if not (settings.project_root / ".git").exists():
         return {"has_git": False, "branch": "", "status": [], "clean": True}
 
-    res_branch = await runner.run("git rev-parse --abbrev-ref HEAD", check_safety=True)
+    res_branch = await runner.run_args(["git", "rev-parse", "--abbrev-ref", "HEAD"], check_safety=True)
     branch = res_branch.stdout.strip() if res_branch.exit_code == 0 else ""
 
-    res_status = await runner.run("git status --porcelain", check_safety=True)
+    res_status = await runner.run_args(["git", "status", "--porcelain"], check_safety=True)
     raw_status = res_status.stdout.strip().splitlines() if res_status.exit_code == 0 else []
 
     status_entries = []
@@ -567,19 +567,19 @@ async def git_diff(
     if not (settings.project_root / ".git").exists():
         return {"has_git": False, "diff": ""}
 
-    cmd = "git diff"
+    args = ["git", "diff"]
     if path:
         workspace = _workspace(settings)
         try:
             target = workspace.resolve(path)
             rel_path = workspace.relative(target)
-            cmd = f"git diff -- {shlex.quote(rel_path)}"
+            args = ["git", "diff", "--", rel_path]
         except SafetyError as exc:
             raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
         except (OSError, ValueError) as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
-    res = await runner.run(cmd, check_safety=True)
+    res = await runner.run_args(args, check_safety=True)
     return {
         "has_git": True,
         "path": path,

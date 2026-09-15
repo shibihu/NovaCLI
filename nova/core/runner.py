@@ -19,7 +19,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from .models import RunResult
 from .safety import SafetyMode, SafetyPolicy
@@ -65,6 +65,16 @@ class ExecutionBackend(Protocol):
         """Execute command and return (exit_code, stdout, stderr, timed_out)."""
         ...
 
+    async def run_exec(
+        self,
+        args: Sequence[str],
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        """Execute argument array directly without shell invocation."""
+        ...
+
 
 class LocalBackend:
     """Local host execution backend."""
@@ -88,6 +98,50 @@ class LocalBackend:
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
             executable=shell,
+            env=env,
+            **popen_kwargs,
+        )
+
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            await self._terminate(process)
+            stdout_b, stderr_b = await self._drain(process)
+        except asyncio.CancelledError:
+            await self._terminate(process)
+            raise
+
+        stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+        exit_code = process.returncode if not timed_out else None
+
+        return exit_code, stdout, stderr, timed_out
+
+    async def run_exec(
+        self,
+        args: Sequence[str],
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        if not args:
+            return 1, "", "empty command arguments", False
+
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+
+        process = await asyncio.create_subprocess_exec(
+            args[0],
+            *args[1:],
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
             env=env,
             **popen_kwargs,
         )
@@ -246,6 +300,76 @@ class DockerBackend:
 
         return exit_code, stdout, stderr, timed_out
 
+    async def run_exec(
+        self,
+        args: Sequence[str],
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float,
+    ) -> tuple[int | None, str, str, bool]:
+        if not args:
+            return 1, "", "empty command arguments", False
+
+        import uuid
+        container_name = f"nova_sandbox_{uuid.uuid4().hex[:12]}"
+
+        docker_args = [
+            "docker", "run",
+            "--name", container_name,
+            "--rm", "-i",
+            "-v", f"{cwd}:/workspace",
+            "-w", "/workspace",
+            "--tmpfs", "/tmp:exec,mode=1777",
+        ]
+
+        if self.read_only:
+            docker_args.append("--read-only")
+
+        if self.cap_drop_all:
+            docker_args.extend(["--cap-drop", "ALL"])
+        if self.no_new_privileges:
+            docker_args.extend(["--security-opt", "no-new-privileges"])
+        if self.pids_limit:
+            docker_args.extend(["--pids-limit", str(self.pids_limit)])
+        if self.memory_limit:
+            docker_args.extend(["--memory", str(self.memory_limit)])
+        if self.cpu_limit:
+            docker_args.extend(["--cpus", str(self.cpu_limit)])
+        if self.network_disabled:
+            docker_args.extend(["--network", "none"])
+
+        for k, v in env.items():
+            docker_args.extend(["-e", f"{k}={v}"])
+
+        docker_args.append(self.image)
+        docker_args.extend(args)
+
+        process = await asyncio.create_subprocess_exec(
+            *docker_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            await self._cleanup_container(container_name, process)
+            stdout_b, stderr_b = b"", b"Docker execution timed out"
+        except asyncio.CancelledError:
+            await self._cleanup_container(container_name, process)
+            raise
+
+        stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+        exit_code = process.returncode if not timed_out else None
+
+        return exit_code, stdout, stderr, timed_out
+
     @staticmethod
     async def _cleanup_container(container_name: str, process: asyncio.subprocess.Process) -> None:
         try:
@@ -369,6 +493,88 @@ class CommandRunner:
 
         return RunResult(
             command=command,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            timed_out=timed_out,
+        )
+
+    async def run_args(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: str | Path | None = None,
+        timeout: int | None = None,
+        approved: bool = False,
+        check_safety: bool = True,
+    ) -> RunResult:
+        """Execute structured argument array directly without shell invocation."""
+        if not args:
+            return RunResult(
+                command="",
+                exit_code=1,
+                stderr="empty arguments",
+                blocked=True,
+                reason="empty command arguments",
+            )
+
+        import shlex
+        command_repr = " ".join(shlex.quote(str(arg)) for arg in args)
+        effective_timeout = float(self.timeout if timeout is None else max(1, int(timeout)))
+
+        if check_safety:
+            verdict = self.safety.check_command(command_repr)
+            if not verdict.allowed:
+                return RunResult(
+                    command=command_repr,
+                    exit_code=None,
+                    blocked=True,
+                    reason=verdict.reason or "blocked by safety policy",
+                )
+            if verdict.requires_approval and not approved:
+                return RunResult(
+                    command=command_repr,
+                    exit_code=None,
+                    blocked=True,
+                    reason=f"requires approval ({verdict.reason})",
+                )
+
+        workdir = self.resolve_cwd(cwd)
+        started = time.perf_counter()
+
+        str_args = [str(arg) for arg in args]
+
+        try:
+            if hasattr(self.backend, "run_exec"):
+                exit_code, raw_stdout, raw_stderr, timed_out = await self.backend.run_exec(
+                    str_args, cwd=workdir, env=self.build_env(), timeout=effective_timeout
+                )
+            else:
+                exit_code, raw_stdout, raw_stderr, timed_out = await self.backend.run(
+                    command_repr, cwd=workdir, env=self.build_env(), timeout=effective_timeout
+                )
+        except (OSError, ValueError) as exc:
+            return RunResult(
+                command=command_repr,
+                exit_code=None,
+                stderr=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                blocked=True,
+                reason=f"could not start command: {exc}",
+            )
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        stdout = _truncate(raw_stdout, self.max_output_bytes)
+        stderr = _truncate(raw_stderr, self.max_output_bytes)
+
+        if timed_out:
+            note = f"command timed out after {effective_timeout:.0f}s and was terminated"
+            stderr = f"{stderr}\n{note}".strip() if stderr else note
+            exit_code = None
+
+        return RunResult(
+            command=command_repr,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,

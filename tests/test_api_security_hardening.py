@@ -2,16 +2,21 @@
 
 Tests cover:
 1. Command injection via /api/run, /api/git/diff, /api/tests/run
-2. Path traversal via /api/file, /api/tree, /api/files, /api/search, /api/delete, /api/rename, /api/mkdir, /api/git/diff
-3. Git diff parameter security and path jailing
-4. Project test runner (/api/tests/run) safety checks and approval workflow
-5. API authentication on developer endpoints
-6. Secret redaction in API error responses
+2. Cross-platform sentinel file injection tests
+3. Special filename handling in Git diff
+4. Path traversal via /api/file, /api/tree, /api/files, /api/search, /api/delete, /api/rename, /api/mkdir, /api/git/diff
+5. Project test runner (/api/tests/run) safety checks and sentinel execution protection
+6. Approval flow verification (Forbidden cannot be approved around)
+7. API authentication on developer endpoints
+8. Secret redaction in API error responses
+9. Static inspection verifying no check_safety=False in routes
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
@@ -49,7 +54,7 @@ def unauth_client(test_app):
 
 
 # ---------------------------------------------------------------------------
-# 1. Command Injection Tests
+# 1. Command Injection Tests & Sentinel Protection
 # ---------------------------------------------------------------------------
 
 
@@ -84,7 +89,7 @@ def test_api_run_command_injection_newline(auth_client):
 
 
 # ---------------------------------------------------------------------------
-# 2. Git Diff Security Tests
+# 2. Git Diff Security & Sentinel Tests
 # ---------------------------------------------------------------------------
 
 
@@ -94,11 +99,45 @@ def test_git_diff_no_git_repo(auth_client):
     assert res.json() == {"has_git": False, "diff": ""}
 
 
-def test_git_diff_command_injection_in_path(auth_client, tmp_path: Path):
+def test_git_diff_sentinel_injection_payloads(auth_client, tmp_path: Path):
     (tmp_path / ".git").mkdir()
-    res = auth_client.get("/api/git/diff", params={"path": "foo; rm -rf ."})
-    assert res.status_code in (200, 400, 403, 404)
-    assert tmp_path.exists()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("ORIGINAL", encoding="utf-8")
+
+    payloads = [
+        "fake.txt; echo PWNED > sentinel.txt",
+        "fake.txt && echo PWNED > sentinel.txt",
+        "fake.txt || echo PWNED > sentinel.txt",
+        "fake.txt$(echo PWNED > sentinel.txt)",
+        "fake.txt`echo PWNED > sentinel.txt`",
+        "fake.txt\necho PWNED > sentinel.txt",
+    ]
+
+    for payload in payloads:
+        res = auth_client.get("/api/git/diff", params={"path": payload})
+        assert res.status_code in (200, 400, 403, 404)
+        assert sentinel.read_text(encoding="utf-8") == "ORIGINAL", f"Sentinel modified by payload {payload!r}"
+
+
+def test_git_diff_special_filenames(auth_client, tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    special_names = [
+        "hello world.txt",
+        "quote'file.txt",
+        'double"quote.txt',
+        "semi;colon.txt",
+        "dollar$(test).txt",
+        "back`tick.txt",
+        "unicode-ไทย.txt",
+        "--leading-dash.txt",
+    ]
+
+    for name in special_names:
+        p = tmp_path / name
+        p.write_text("content", encoding="utf-8")
+        res = auth_client.get("/api/git/diff", params={"path": name})
+        assert res.status_code == 200
+        assert res.json()["has_git"] is True
 
 
 def test_git_diff_path_traversal_outside_workspace(auth_client, tmp_path: Path):
@@ -117,7 +156,7 @@ def test_git_diff_sensitive_file_refusal(auth_client, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 3. Test Runner Security Tests
+# 3. Test Runner Security & Sentinel Tests
 # ---------------------------------------------------------------------------
 
 
@@ -138,13 +177,17 @@ def test_test_runner_malicious_package_json_command(auth_client, tmp_path: Path)
     assert "Refused" in res.json()["detail"]
 
 
-def test_test_runner_sensitive_target_command(auth_client, tmp_path: Path):
+def test_test_runner_sentinel_command_blocked(auth_client, tmp_path: Path):
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("ORIGINAL", encoding="utf-8")
+
     pkg_json = tmp_path / "package.json"
-    pkg_json.write_text('{"scripts": {"test": "cat .env"}}', encoding="utf-8")
+    cmd = f"{sys.executable} -c \"import pathlib; pathlib.Path('sentinel.txt').write_text('PWNED')\""
+    pkg_json.write_text(json.dumps({"scripts": {"test": cmd}}), encoding="utf-8")
 
     res = auth_client.post("/api/tests/run")
-    assert res.status_code == 403
-    assert "protected credential path" in res.json()["detail"]
+    assert res.status_code in (200, 403)
+    assert sentinel.read_text(encoding="utf-8") == "ORIGINAL"
 
 
 def test_test_runner_safe_command_execution(auth_client, tmp_path: Path):
@@ -158,7 +201,45 @@ def test_test_runner_safe_command_execution(auth_client, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 4. Path Traversal & Symlink Security Tests
+# 4. Approval Flow Security Tests
+# ---------------------------------------------------------------------------
+
+
+def test_approval_flow_forbidden_command_never_executes_even_with_approve(auth_client):
+    res = auth_client.post("/api/run", json={"command": "rm -rf /", "approve": True})
+    assert res.status_code == 403
+    assert "Refused" in res.json()["detail"]
+
+
+def test_approval_flow_moderate_command_without_and_with_approval(tmp_path: Path):
+    settings = load_settings(
+        project_root=tmp_path,
+        env={
+            "GROQ_API_KEY": "gsk_live_secret_key_123456789012345",
+            "NOVA_WEB_TOKEN": "secret-token-123",
+            "NOVA_SAFETY_MODE": "strict",
+        },
+        user_config_path=tmp_path / "_no_user_config.json",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+    client.headers["Authorization"] = "Bearer secret-token-123"
+
+    (tmp_path / "rm_me.txt").write_text("content", encoding="utf-8")
+
+    res_no = client.post("/api/run", json={"command": "rm rm_me.txt", "approve": False})
+    assert res_no.status_code == 200
+    assert res_no.json()["requires_approval"] is True
+    assert (tmp_path / "rm_me.txt").exists()
+
+    res_yes = client.post("/api/run", json={"command": "rm rm_me.txt", "approve": True})
+    assert res_yes.status_code == 200
+    assert res_yes.json()["requires_approval"] is False
+    assert not (tmp_path / "rm_me.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# 5. Path Traversal & Symlink Security Tests
 # ---------------------------------------------------------------------------
 
 
@@ -221,7 +302,7 @@ def test_symlink_escape(auth_client, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 5. API Authentication Boundaries
+# 6. API Authentication Boundaries
 # ---------------------------------------------------------------------------
 
 
@@ -251,7 +332,7 @@ def test_unauthenticated_api_endpoints_rejected(unauth_client):
 
 
 # ---------------------------------------------------------------------------
-# 6. Error Handling & Secret Leakage Prevention
+# 7. Error Handling & Secret Leakage Prevention
 # ---------------------------------------------------------------------------
 
 
@@ -261,3 +342,14 @@ def test_error_responses_do_not_leak_secrets(test_app, auth_client):
     detail = res.json()["detail"]
     assert "gsk_live_secret_key" not in detail
     assert "secret-token-123" not in detail
+
+
+# ---------------------------------------------------------------------------
+# 8. Static Safety Bypass Inspection
+# ---------------------------------------------------------------------------
+
+
+def test_routes_file_has_no_check_safety_false():
+    routes_path = Path(__file__).resolve().parent.parent / "nova" / "web" / "routes.py"
+    text = routes_path.read_text(encoding="utf-8")
+    assert "check_safety=False" not in text, "routes.py must not contain check_safety=False bypasses"
