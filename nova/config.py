@@ -534,7 +534,7 @@ def load_settings(
         reasoning_effort=reasoning_effort,
         execution_backend=layered("NOVA_EXECUTION_BACKEND") or "local",
         docker_image=layered("NOVA_DOCKER_IMAGE") or "python:3.12-slim",
-        environment=dict(environ),
+        environment={**dotenv, **environ},
     )
 
     if overrides:
