@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from nova.ai import AIProviderError, get_provider
 from nova.config import get_api_key_hint, NovaConfigStore, Settings
 from nova.core.agent import AgentController, build_agent
+from nova.core.checkpoints import CheckpointManager
+from nova.core.git import GitService
 from nova.core.models import ApprovalDecision, RiskLevel
 from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyError, SafetyPolicy
@@ -80,6 +82,15 @@ class TestRunBody(BaseModel):
     """Body of ``POST /api/tests/run``."""
 
     approve: bool = False
+
+
+class CheckpointCreateBody(BaseModel):
+    task_id: str = Field(min_length=1, max_length=100)
+    session_id: str | None = None
+
+
+class RollbackBody(BaseModel):
+    confirm: bool = False
 
 
 class MkdirBody(BaseModel):
@@ -525,33 +536,12 @@ async def mkdir(request: Request, body: MkdirBody) -> dict[str, Any]:
 
 @router.get("/api/git/status")
 async def git_status(request: Request) -> dict[str, Any]:
-    """Return basic git branch and status summary if repository exists."""
+    """Return basic git branch and status summary."""
     settings = _settings(request)
-    safety = _safety(settings)
-    runner = CommandRunner(settings.project_root, timeout=10, safety=safety)
-
-    if not (settings.project_root / ".git").exists():
-        return {"has_git": False, "branch": "", "status": [], "clean": True}
-
-    res_branch = await runner.run_args(["git", "rev-parse", "--abbrev-ref", "HEAD"], check_safety=True)
-    branch = res_branch.stdout.strip() if res_branch.exit_code == 0 else ""
-
-    res_status = await runner.run_args(["git", "status", "--porcelain"], check_safety=True)
-    raw_status = res_status.stdout.strip().splitlines() if res_status.exit_code == 0 else []
-
-    status_entries = []
-    for line in raw_status:
-        if len(line) >= 3:
-            xy = line[:2]
-            p = line[3:].strip()
-            status_entries.append({"state": xy, "path": p})
-
-    return {
-        "has_git": True,
-        "branch": branch,
-        "status": status_entries,
-        "clean": len(status_entries) == 0,
-    }
+    workspace = _workspace(settings)
+    runner = CommandRunner(settings.project_root, timeout=10, safety=_safety(settings))
+    git_svc = GitService(workspace, runner)
+    return await git_svc.status()
 
 
 @router.get("/api/git/diff")
@@ -561,30 +551,86 @@ async def git_diff(
 ) -> dict[str, Any]:
     """Return git diff for a file or entire repository."""
     settings = _settings(request)
-    safety = _safety(settings)
-    runner = CommandRunner(settings.project_root, timeout=15, safety=safety)
+    workspace = _workspace(settings)
+    runner = CommandRunner(settings.project_root, timeout=15, safety=_safety(settings))
+    git_svc = GitService(workspace, runner)
+    try:
+        return await git_svc.diff(path)
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
-    if not (settings.project_root / ".git").exists():
-        return {"has_git": False, "diff": ""}
 
-    args = ["git", "diff"]
-    if path:
-        workspace = _workspace(settings)
-        try:
-            target = workspace.resolve(path)
-            rel_path = workspace.relative(target)
-            args = ["git", "diff", "--", rel_path]
-        except SafetyError as exc:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+@router.get("/api/git/commit_preview")
+async def git_commit_preview(request: Request) -> dict[str, Any]:
+    """Return a preview of staged and unstaged changes for commit."""
+    settings = _settings(request)
+    workspace = _workspace(settings)
+    runner = CommandRunner(settings.project_root, timeout=15, safety=_safety(settings))
+    git_svc = GitService(workspace, runner)
+    return await git_svc.commit_preview()
 
-    res = await runner.run_args(args, check_safety=True)
-    return {
-        "has_git": True,
-        "path": path,
-        "diff": res.stdout if res.exit_code == 0 else "",
-    }
+
+@router.get("/api/agent/checkpoints")
+async def list_checkpoints(request: Request) -> dict[str, Any]:
+    """List all agent checkpoints in workspace."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    cps = cpm.list()
+    return {"checkpoints": [cp.to_dict() for cp in cps]}
+
+
+@router.get("/api/agent/checkpoint/{checkpoint_id}")
+async def get_checkpoint(request: Request, checkpoint_id: str) -> dict[str, Any]:
+    """Inspect details and changed files for a checkpoint."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    try:
+        return cpm.inspect(checkpoint_id)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.post("/api/agent/checkpoint")
+async def create_checkpoint(request: Request, body: CheckpointCreateBody) -> dict[str, Any]:
+    """Manually create an agent checkpoint."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    cp = cpm.create(body.task_id, session_id=body.session_id)
+    return {"ok": True, "checkpoint": cp.to_dict()}
+
+
+@router.post("/api/agent/checkpoint/{checkpoint_id}/rollback")
+async def rollback_checkpoint(
+    request: Request, checkpoint_id: str, body: RollbackBody | None = None
+) -> dict[str, Any]:
+    """Safely rollback workspace state to a checkpoint baseline."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    confirm = body.confirm if body else False
+    try:
+        res = cpm.rollback(checkpoint_id, force=confirm)
+        return res.to_dict()
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.delete("/api/agent/checkpoint/{checkpoint_id}")
+async def delete_checkpoint(request: Request, checkpoint_id: str) -> dict[str, Any]:
+    """Delete a checkpoint record and its snapshots."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    deleted = cpm.delete(checkpoint_id)
+    if not deleted:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"Checkpoint {checkpoint_id!r} not found"
+        )
+    return {"ok": True, "checkpoint_id": checkpoint_id}
 
 
 @router.post("/api/tests/run")

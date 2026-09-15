@@ -269,6 +269,8 @@ class AgentResult:
     model: str = ""
     started_at: str = field(default_factory=utc_now_iso)
     finished_at: str | None = None
+    checkpoint_id: str | None = None
+    changed_files: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

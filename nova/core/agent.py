@@ -22,6 +22,7 @@ from nova.ai import AIProvider, AIProviderError
 from nova.config import Settings, load_settings
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
+from nova.core.checkpoints import CheckpointManager
 
 from .context import ContextBuilder
 from .models import (
@@ -576,6 +577,7 @@ class NovaAgent:
         self.toolbox = toolbox or ToolBox(
             self.workspace, self.runner, analyzer=self.analyzer, safety=self.safety
         )
+        self.checkpoint_manager = CheckpointManager(self.workspace)
         self.provider = provider
         self.max_steps = max_steps or self.settings.max_steps
         self.system_prompt = system_prompt or SYSTEM_PROMPT
@@ -606,6 +608,9 @@ class NovaAgent:
         controller = controller or AgentController()
         limit = max_steps or self.max_steps
 
+        checkpoint = self.checkpoint_manager.create(task_id=task[:20])
+        checkpoint_id = checkpoint.id
+
         yield AgentEvent(
             EventType.AGENT_START,
             {
@@ -614,6 +619,7 @@ class NovaAgent:
                 "project": str(self.workspace.root),
                 "max_steps": limit,
                 "safety_mode": str(self.safety.mode),
+                "checkpoint_id": checkpoint_id,
             },
         )
 
@@ -798,9 +804,17 @@ class NovaAgent:
             if decision.is_final:
                 steps.append(AgentStep(index=index, thought=decision.thought, final_answer=decision.final))
                 yield AgentEvent(EventType.PROGRESS, {"percent": 100}, step=index)
+                inspection = self.checkpoint_manager.inspect(checkpoint_id)
+                changed_files = inspection.get("changed_files", [])
                 yield AgentEvent(
                     EventType.FINAL,
-                    {"answer": decision.final, "steps": len(steps), "files": files},
+                    {
+                        "answer": decision.final,
+                        "steps": len(steps),
+                        "files": files,
+                        "checkpoint_id": checkpoint_id,
+                        "changed_files": changed_files,
+                    },
                     step=index,
                 )
                 return
@@ -854,9 +868,18 @@ class NovaAgent:
             f"Stopped after the maximum of {limit} steps without a final answer.\n\n"
             + self._progress_digest(steps)
         )
+        inspection = self.checkpoint_manager.inspect(checkpoint_id)
+        changed_files = inspection.get("changed_files", [])
         yield AgentEvent(
             EventType.FINAL,
-            {"answer": answer, "steps": len(steps), "limit_reached": True, "files": files},
+            {
+                "answer": answer,
+                "steps": len(steps),
+                "limit_reached": True,
+                "files": files,
+                "checkpoint_id": checkpoint_id,
+                "changed_files": changed_files,
+            },
             step=limit,
         )
 
@@ -906,9 +929,13 @@ class NovaAgent:
                     blocked=True,
                     error=str(event.data.get("reason", "")),
                 )
+            elif event.type == EventType.AGENT_START:
+                result.checkpoint_id = event.data.get("checkpoint_id")
             elif event.type == EventType.FINAL:
                 result.answer = str(event.data.get("answer", ""))
                 result.status = AgentStatus.DONE
+                result.checkpoint_id = str(event.data.get("checkpoint_id", "") or result.checkpoint_id)
+                result.changed_files = list(event.data.get("changed_files") or [])
                 steps.setdefault(event.step, AgentStep(index=event.step)).final_answer = result.answer
             elif event.type == EventType.ERROR:
                 result.error = str(event.data.get("message", "unknown error"))

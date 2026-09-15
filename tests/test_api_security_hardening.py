@@ -96,7 +96,9 @@ def test_api_run_command_injection_newline(auth_client):
 def test_git_diff_no_git_repo(auth_client):
     res = auth_client.get("/api/git/diff")
     assert res.status_code == 200
-    assert res.json() == {"has_git": False, "diff": ""}
+    data = res.json()
+    assert data["has_git"] is False
+    assert data["diff"] == ""
 
 
 def test_git_diff_sentinel_injection_payloads(auth_client, tmp_path: Path):

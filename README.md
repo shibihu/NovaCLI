@@ -404,6 +404,15 @@ NovaCLI supports two command execution backends:
    - Applies container safety flags: `--cap-drop=ALL`, `--security-opt=no-new-privileges`, memory/CPU limits (`--memory 512m`, `--cpus 1.5`), `--pids-limit 256`, and isolated `/tmp` tmpfs.
    - Automatically terminates hanging containers on command timeout to prevent orphaned processes.
 
+## Agent Checkpoints, Diff Review & Undo
+
+NovaCLI automatically captures recovery checkpoints before/during Agent tasks:
+- **Checkpoints**: Stored under `.nova/checkpoints/` (ignored by Git). Snapshots text files without copying sensitive credentials (`.env`, keys).
+- **User Ownership Protection**: Pre-existing user uncommitted changes are tracked and preserved during rollbacks (`preserved_due_to_ownership_conflict`).
+- **Diff Review**: Inspect changed files, added/removed lines, and unified diffs before accepting or undoing changes.
+- **Undo / Rollback**: Safely restores Agent-modified files and removes Agent-created files without destroying user-owned work.
+- **Git Workflow**: Structured Git operations (`status`, `diff`, `commit_preview`) executed safely via `CommandRunner.run_args()`.
+
 ### Developer API & Command Execution Security
 
 All developer APIs and Web IDE endpoints enforce strict security boundaries:
