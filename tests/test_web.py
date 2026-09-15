@@ -290,3 +290,28 @@ def test_start_agent_with_auto_approve(client: TestClient, monkeypatch, tmp_proj
     read_sse(client, f"/api/agent/stream?session_id={session_id}")
 
     assert (tmp_project / "auto.py").read_text() == "y = 2\n"
+
+
+# --- Global Search & Developer Endpoint Tests --------------------------------
+
+
+def test_search_files_basic(client: TestClient) -> None:
+    res = client.get("/api/search", params={"q": "greet"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["query"] == "greet"
+    assert len(data["hits"]) >= 1
+
+
+def test_search_files_with_regex_and_case(client: TestClient) -> None:
+    res = client.get("/api/search", params={"q": "def\s+greet", "regex": "true", "case_sensitive": "true"})
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["hits"]) >= 1
+
+
+def test_search_files_with_glob(client: TestClient) -> None:
+    res = client.get("/api/search", params={"q": "greet", "glob": "*.py"})
+    assert res.status_code == 200
+    data = res.json()
+    assert all(hit["path"].endswith(".py") for hit in data["hits"])
