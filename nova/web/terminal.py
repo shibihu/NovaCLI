@@ -34,6 +34,7 @@ import json
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from nova.core.safety import redact_secrets
 
 from nova.core.pty import PTYManager
 
@@ -90,11 +91,7 @@ def _redact(message: str, websocket: WebSocket) -> str:
     """
     settings = getattr(websocket.app.state, "settings", None)
     secrets = getattr(settings, "active_secrets", None) or ()
-    text = str(message)
-    for secret in secrets:
-        if secret and len(str(secret)) >= 6:
-            text = text.replace(str(secret), "***")
-    return text
+    return redact_secrets(str(message), *secrets)
 
 
 async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -223,6 +220,8 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         rows = int(websocket.query_params.get("rows", 24))
     except (ValueError, TypeError):
         cols, rows = 80, 24
+    cols = max(10, min(cols, 500))
+    rows = max(5, min(rows, 200))
 
     # Create the PTY session. Failures are surfaced to the client instead of
     # being swallowed, because a terminal that cannot start is unusable.

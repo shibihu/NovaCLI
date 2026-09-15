@@ -7,6 +7,7 @@ logic is duplicated here — starting a task just constructs the same
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -73,6 +74,12 @@ class RenameBody(BaseModel):
 
     old_path: str = Field(min_length=1, max_length=1_000)
     new_path: str = Field(min_length=1, max_length=1_000)
+
+
+class TestRunBody(BaseModel):
+    """Body of ``POST /api/tests/run``."""
+
+    approve: bool = False
 
 
 class MkdirBody(BaseModel):
@@ -229,7 +236,9 @@ async def tree(
     workspace = _workspace(_settings(request))
     try:
         return {"path": path, "tree": workspace.tree(path, max_depth=depth, max_entries=300)}
-    except (OSError, ValueError, SafetyError) as exc:
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
@@ -241,7 +250,9 @@ async def list_files(
     workspace = _workspace(_settings(request))
     try:
         entries = workspace.list_dir(path)
-    except (OSError, ValueError, SafetyError) as exc:
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     return {"path": path, "entries": [entry.to_dict() for entry in entries]}
 
@@ -311,7 +322,7 @@ async def run_command(request: Request, body: RunBody) -> dict[str, Any]:
         settings.project_root, settings.command_timeout, safety=safety
     )
     result = await runner.run(
-        body.command, cwd=body.cwd, approved=body.approve, check_safety=False
+        body.command, cwd=body.cwd, approved=body.approve, check_safety=True
     )
     return {"requires_approval": False, "result": result.to_dict()}
 
@@ -452,7 +463,9 @@ async def search_files(
             regex=regex,
         )
         return {"query": q, "hits": [hit.to_dict() for hit in hits]}
-    except (OSError, ValueError, SafetyError) as exc:
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
@@ -520,10 +533,10 @@ async def git_status(request: Request) -> dict[str, Any]:
     if not (settings.project_root / ".git").exists():
         return {"has_git": False, "branch": "", "status": [], "clean": True}
 
-    res_branch = await runner.run("git rev-parse --abbrev-ref HEAD", check_safety=False)
+    res_branch = await runner.run("git rev-parse --abbrev-ref HEAD", check_safety=True)
     branch = res_branch.stdout.strip() if res_branch.exit_code == 0 else ""
 
-    res_status = await runner.run("git status --porcelain", check_safety=False)
+    res_status = await runner.run("git status --porcelain", check_safety=True)
     raw_status = res_status.stdout.strip().splitlines() if res_status.exit_code == 0 else []
 
     status_entries = []
@@ -557,10 +570,16 @@ async def git_diff(
     cmd = "git diff"
     if path:
         workspace = _workspace(settings)
-        rel_path = workspace.relative(path)
-        cmd = f"git diff -- {rel_path}"
+        try:
+            target = workspace.resolve(path)
+            rel_path = workspace.relative(target)
+            cmd = f"git diff -- {shlex.quote(rel_path)}"
+        except SafetyError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
-    res = await runner.run(cmd, check_safety=False)
+    res = await runner.run(cmd, check_safety=True)
     return {
         "has_git": True,
         "path": path,
@@ -569,7 +588,10 @@ async def git_diff(
 
 
 @router.post("/api/tests/run")
-async def run_tests(request: Request) -> dict[str, Any]:
+async def run_tests(
+    request: Request,
+    body: TestRunBody | None = None,
+) -> dict[str, Any]:
     """Discover and safely execute detected project test command."""
     settings = _settings(request)
     workspace = _workspace(settings)
@@ -580,9 +602,34 @@ async def run_tests(request: Request) -> dict[str, Any]:
     if not test_cmd:
         return {"ok": False, "error": "No test runner command detected for this project.", "output": ""}
 
+    approve = body.approve if body else False
     safety = _safety(settings)
+    verdict = safety.check_command(test_cmd)
+
+    if verdict.level == RiskLevel.FORBIDDEN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Refused: {verdict.reason}",
+        )
+    if verdict.requires_approval and not approve:
+        return {
+            "requires_approval": True,
+            "level": str(verdict.level),
+            "reason": verdict.reason,
+            "command": test_cmd,
+        }
+
     runner = CommandRunner(settings.project_root, timeout=60, safety=safety)
-    res = await runner.run(test_cmd, check_safety=False)
+    res = await runner.run(test_cmd, approved=approve, check_safety=True)
+
+    if res.blocked:
+        return {
+            "ok": False,
+            "command": test_cmd,
+            "error": res.reason or "Command blocked by safety policy",
+            "output": res.stderr or res.reason or "",
+            "exit_code": None,
+        }
 
     out = res.stdout + ("\n" + res.stderr if res.stderr else "")
     return {
@@ -601,15 +648,21 @@ async def run_tests(request: Request) -> dict[str, Any]:
 def register_exception_handlers(app: Any) -> None:
     """Map NovaCLI's own exceptions onto sensible HTTP status codes."""
     from nova.config import ConfigError
-    from nova.core.safety import SafetyError as CoreSafetyError
+    from nova.core.safety import SafetyError as CoreSafetyError, redact_secrets
 
     @app.exception_handler(ConfigError)
     async def _config_error(request: Request, exc: Exception) -> JSONResponse:  # noqa: ARG001
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
+        settings = getattr(request.app.state, "settings", None)
+        secrets = getattr(settings, "active_secrets", ()) if settings else ()
+        msg = redact_secrets(str(exc), *secrets)
+        return JSONResponse(status_code=400, content={"detail": msg})
 
     @app.exception_handler(CoreSafetyError)
     async def _safety_error(request: Request, exc: Exception) -> JSONResponse:  # noqa: ARG001
-        return JSONResponse(status_code=403, content={"detail": str(exc)})
+        settings = getattr(request.app.state, "settings", None)
+        secrets = getattr(settings, "active_secrets", ()) if settings else ()
+        msg = redact_secrets(str(exc), *secrets)
+        return JSONResponse(status_code=403, content={"detail": msg})
 
 
 __all__ = ["router", "register_exception_handlers"]

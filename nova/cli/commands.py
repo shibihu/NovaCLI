@@ -413,7 +413,7 @@ def cmd_run(args: argparse.Namespace, console: Console) -> int:
         settings.command_timeout,
         safety=safety,
     )
-    result = asyncio.run(runner.run(command, approved=args.yes, check_safety=False))
+    result = asyncio.run(runner.run(command, approved=args.yes, check_safety=True))
 
     if result.stdout:
         console.write(result.stdout.rstrip())
