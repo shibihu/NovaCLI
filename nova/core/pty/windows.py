@@ -234,42 +234,36 @@ def _kernel32_api():
         return _kernel32
 
 
-def _find_shell(env: Mapping[str, str] | None = None) -> str:
+def _find_shell() -> str:
     """Find the Windows shell executable."""
-    environ = env if env is not None else os.environ
-    shell_env = environ.get("NOVA_TERMINAL_SHELL")
+    shell_env = os.environ.get("NOVA_TERMINAL_SHELL")
     if shell_env:
         # User explicitly configured a shell
         if os.path.exists(shell_env):
             return shell_env
         # Try resolving from PATH
-        resolved = shutil.which(shell_env, path=environ.get("PATH"))
-        if resolved and os.path.exists(resolved):
+        resolved = shutil.which(shell_env)
+        if resolved:
             return resolved
         raise RuntimeError(f"Configured shell not found: {shell_env}")
 
     # Try COMSPEC (standard Windows shell path)
-    comspec = environ.get("COMSPEC")
+    comspec = os.environ.get("COMSPEC")
     if comspec and os.path.exists(comspec):
         return comspec
 
-    # Try standard Windows shell executables via PATH
-    path_val = environ.get("PATH")
-    for candidate in ("cmd.exe", "powershell.exe", "pwsh.exe"):
-        resolved = shutil.which(candidate, path=path_val)
-        if resolved and os.path.exists(resolved):
-            return resolved
-
-    # Fallback candidates by standard absolute paths
+    # Fallback candidates
     candidates = [
-        r"C:\Windows\System32\cmd.exe",
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "C:\\Windows\\System32\\cmd.exe",
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
     ]
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
 
     raise RuntimeError("No Windows shell found (cmd.exe or powershell.exe)")
+
+
 def _build_env_block(env: Mapping[str, str]) -> ctypes.Array:
     """Serialise *env* into the UTF-16 environment block Windows expects."""
     entries = "".join(f"{key}={value}\0" for key, value in env.items())
@@ -297,31 +291,13 @@ class PTYSession(PTYSessionBase):
         """Initialize Windows ConPTY session."""
         super().__init__(session_id, cwd, cols=cols, rows=rows, shell_path=shell_path, env=env)
 
-        # Build secret-scrubbed environment from server's effective environment
-        base_env = dict(os.environ)
-        if env is not None:
-            base_env.update(env)
+        self.shell_path = shell_path or _find_shell()
 
-        # Case-insensitive secret scrubbing
-        scrubbed_upper = {k.upper() for k in SCRUBBED_ENV_KEYS}
-        keys_to_remove = [
-            k for k in base_env
-            if k.upper() in scrubbed_upper or k.upper().startswith("NOVA_SECRET")
-        ]
-        for key in keys_to_remove:
-            base_env.pop(key, None)
-
-        # Normalize PATH on Windows if case variants exist
-        path_val = None
-        for k in list(base_env.keys()):
-            if k.upper() == "PATH":
-                if path_val is None:
-                    path_val = base_env[k]
-                if k != "PATH":
-                    base_env.pop(k, None)
-        if path_val is not None:
-            base_env["PATH"] = path_val
-
+        # Build secret-scrubbed environment
+        base_env = dict(env if env is not None else os.environ)
+        for key in list(base_env):
+            if key in SCRUBBED_ENV_KEYS or key.startswith("NOVA_SECRET"):
+                base_env.pop(key, None)
         base_env.update(
             {
                 "TERM": "xterm-256color",
@@ -330,18 +306,6 @@ class PTYSession(PTYSessionBase):
             }
         )
         self.env = base_env
-
-        if shell_path:
-            if os.path.exists(shell_path):
-                self.shell_path = shell_path
-            else:
-                resolved = shutil.which(shell_path, path=self.env.get("PATH"))
-                if resolved and os.path.exists(resolved):
-                    self.shell_path = resolved
-                else:
-                    raise RuntimeError(f"Configured shell not found: {shell_path}")
-        else:
-            self.shell_path = _find_shell(self.env)
 
         # Output buffer (thread-safe) filled by the reader thread
         self.output_buffer: collections.deque[bytes] = collections.deque(maxlen=10000)

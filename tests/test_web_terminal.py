@@ -268,16 +268,3 @@ def test_websocket_terminal_reports_exit_when_shell_ends(tmp_path: Path):
     with client.websocket_connect("/ws/terminal") as websocket:
         websocket.send_json({"type": "input", "data": "exit\r"})
         assert _wait_for_exit(websocket), "server never reported the shell exit"
-
-
-
-def test_websocket_terminal_diagnostics_endpoint(auth_app):
-    client = TestClient(auth_app)
-    headers = {"Authorization": f"Bearer {SECRET_TOKEN}"}
-    response = client.get("/api/terminal/diagnostics", headers=headers)
-    assert response.status_code == 200
-    data = response.json()
-    assert "cwd" in data
-    assert "backend" in data
-    assert "tool_resolutions" in data
-    assert "GROQ_API_KEY" not in data

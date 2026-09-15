@@ -227,8 +227,7 @@ async def terminal_websocket(websocket: WebSocket) -> None:
     # Create the PTY session. Failures are surfaced to the client instead of
     # being swallowed, because a terminal that cannot start is unusable.
     try:
-        server_env = dict(settings.environment) if settings and hasattr(settings, "environment") and settings.environment else None
-        session = pty_manager.create(project_root, cols=cols, rows=rows, env=server_env)
+        session = pty_manager.create(project_root, cols=cols, rows=rows)
     except Exception as exc:
         logger.error("Failed to start PTY terminal session: %s", exc)
         await _send_error(websocket, f"Failed to start terminal: {exc}")
