@@ -205,3 +205,24 @@ async def test_result_to_dict_is_json_safe(safe_runner: CommandRunner) -> None:
     data = (await safe_runner.run("echo json")).to_dict()
     json.dumps(data)
     assert data["exit_code"] == 0
+
+
+# --- run_args direct execution ----------------------------------------------
+
+
+async def test_run_args_executes_direct_args_without_shell(safe_runner: CommandRunner) -> None:
+    args = [
+        sys.executable,
+        "-c",
+        "import sys; print(repr(sys.argv[1]))",
+        "hello; echo PWNED",
+    ]
+    result = await safe_runner.run_args(args)
+    assert result.exit_code == 0
+    assert "'hello; echo PWNED'" in result.stdout
+
+
+async def test_run_args_respects_safety_policy(tmp_path: Path) -> None:
+    runner = CommandRunner(tmp_path, safety=SafetyPolicy(tmp_path))
+    result = await runner.run_args(["rm", "-rf", "/"])
+    assert result.blocked is True
