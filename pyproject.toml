@@ -50,6 +50,14 @@ include = ["nova*"]
 "nova.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/vendor/xterm/*"]
 
 [tool.pytest.ini_options]
+markers = [
+  "unit: Unit tests",
+  "integration: Integration tests",
+  "windows: Windows-specific tests",
+  "unix: Unix-specific tests",
+  "security: Security and safety policy tests",
+  "external: Tests requiring external services or API keys",
+]
 minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
