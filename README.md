@@ -404,6 +404,14 @@ NovaCLI supports two command execution backends:
    - Applies container safety flags: `--cap-drop=ALL`, `--security-opt=no-new-privileges`, memory/CPU limits (`--memory 512m`, `--cpus 1.5`), `--pids-limit 256`, and isolated `/tmp` tmpfs.
    - Automatically terminates hanging containers on command timeout to prevent orphaned processes.
 
+### Developer API & Command Execution Security
+
+All developer APIs and Web IDE endpoints enforce strict security boundaries:
+- **Project Test Execution (`POST /api/tests/run`)**: Commands detected from project metadata (`package.json`, `Makefile`, etc.) are treated as untrusted code execution targets and strictly evaluated through `SafetyPolicy`. High-risk or forbidden commands are blocked or require explicit approval.
+- **Git Path Jailing (`GET /api/git/diff`)**: File paths passed to Git APIs are validated against the workspace root (`Workspace.resolve`) and safely escaped (`shlex.quote`) to prevent path traversal or shell command injection.
+- **Workspace Path Traversal Protection**: File operations (`/api/file`, `/api/tree`, `/api/files`, `/api/search`, `/api/file/rename`, `/api/file/mkdir`) reject escape attempts (`../`, `..\`, absolute paths, Windows drive paths, UNC paths, and symlinks pointing outside the workspace).
+- **Interactive Terminal**: Authenticated WebSocket terminal connections provide direct interactive shell access guarded by `NOVA_WEB_TOKEN` authentication.
+
 > **Security Threat Model & Limitations**:
 > `SafetyPolicy` provides application-level policy enforcement and credential filtering. It is not an unbreakable OS sandbox.
 > Optional Docker isolation adds container-level confinement, but workspace files remain mounted for tool usability.
