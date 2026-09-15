@@ -688,26 +688,20 @@ def cmd_doctor(args: argparse.Namespace, console: Console) -> int:
     else:
         console.warn("no POSIX shell found — command execution disabled")
 
-    # Terminal & environment diagnostics
+    # Diagnose PTY backend for interactive terminal
     try:
-        from nova.core.pty import get_terminal_diagnostics
-        diag = get_terminal_diagnostics(cwd=str(settings.project_root), env=dict(settings.environment))
-        backend = diag.get("backend", "unknown")
-        shell_path = diag.get("shell") or "not detected"
-        if shell_path and shell_path != "not detected":
+        from nova.core.pty import get_pty_backend_info
+        pty_info = get_pty_backend_info()
+
+        if pty_info.get("pty_status") == "Available":
+            backend = pty_info.get("backend", "unknown")
+            shell_path = pty_info.get("shell", "not detected")
             console.ok(f"terminal PTY: {backend}")
             console.write(f"    shell: {shell_path}")
         else:
-            console.warn(f"terminal PTY unavailable: no shell found")
+            error_msg = pty_info.get("pty_error", "unknown error")
+            console.warn(f"terminal PTY unavailable: {error_msg}")
             failures += 1
-
-        tools = diag.get("tool_resolutions", {})
-        console.write("  command resolution:")
-        for tool_name, resolved_path in tools.items():
-            if resolved_path:
-                console.write(f"    {tool_name:8s} -> {resolved_path}")
-            else:
-                console.write(f"    {tool_name:8s} -> (not found in PATH)")
     except Exception as e:
         console.warn(f"could not diagnose PTY backend: {e}")
 
