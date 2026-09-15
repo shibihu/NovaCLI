@@ -46,6 +46,8 @@ from nova.core.runner import CommandRunner
 from nova.core.safety import SafetyError, SafetyPolicy
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
+from nova.core.checkpoints import CheckpointManager
+from nova.core.git import GitService
 from nova.intelligence.cache import IntelligenceCache
 
 # ---------------------------------------------------------------------------
@@ -952,7 +954,114 @@ def build_parser() -> argparse.ArgumentParser:
     p_version = add("version", "Print the NovaCLI version.")
     p_version.set_defaults(func=cmd_version)
 
+    p_checkpoint = add("checkpoint", "List or rollback agent checkpoints.")
+    cp_sub = p_checkpoint.add_subparsers(dest="checkpoint_subcommand")
+    p_cp_list = cp_sub.add_parser("list", parents=[common], help="List checkpoints.")
+    p_cp_list.set_defaults(func=cmd_checkpoint)
+    p_cp_show = cp_sub.add_parser("show", parents=[common], help="Inspect a checkpoint.")
+    p_cp_show.add_argument("checkpoint_id", help="Checkpoint ID")
+    p_cp_show.set_defaults(func=cmd_checkpoint)
+    p_cp_rb = cp_sub.add_parser("rollback", parents=[common], help="Rollback a checkpoint.")
+    p_cp_rb.add_argument("checkpoint_id", help="Checkpoint ID")
+    p_cp_rb.add_argument("--confirm", action="store_true", help="Confirm rollback")
+    p_cp_rb.set_defaults(func=cmd_checkpoint)
+    p_checkpoint.set_defaults(func=cmd_checkpoint)
+
+    p_git_cmd = add("git", "Git workflow commands.")
+    git_sub = p_git_cmd.add_subparsers(dest="git_subcommand")
+    p_git_st = git_sub.add_parser("status", parents=[common], help="Show git status.")
+    p_git_st.set_defaults(func=cmd_git)
+    p_git_df = git_sub.add_parser("diff", parents=[common], help="Show git diff.")
+    p_git_df.add_argument("path", nargs="?", default=None, help="Optional relative file path")
+    p_git_df.set_defaults(func=cmd_git)
+    p_git_cmd.set_defaults(func=cmd_git)
+
     return parser
+
+
+def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Console) -> int:
+    workspace = Workspace(settings.project_root)
+    cpm = CheckpointManager(workspace)
+
+    subcommand = getattr(args, "checkpoint_subcommand", None) or "list"
+
+    if subcommand == "list":
+        cps = cpm.list()
+        if not cps:
+            console.write("No agent checkpoints found.")
+            return 0
+        console.header("Agent Checkpoints")
+        for cp in cps:
+            console.write(f"- {cp.id} | task: {cp.task_id} | created: {cp.created_at}")
+        return 0
+
+    if subcommand in ("show", "inspect"):
+        cp_id = getattr(args, "checkpoint_id", "")
+        if not cp_id:
+            console.error("Missing checkpoint ID.")
+            return 1
+        try:
+            info = cpm.inspect(cp_id)
+            console.header(f"Checkpoint {cp_id}")
+            console.write(f"Task ID: {info['task_id']}")
+            console.write(f"Created: {info['created_at']}")
+            console.write(f"Changed files ({info['total_changes']}):")
+            for change in info["changed_files"]:
+                console.write(f"  [{change['status']}] {change['path']} (user_owned: {change['is_user_owned']})")
+            return 0
+        except Exception as exc:
+            console.error(f"Error inspecting checkpoint: {exc}")
+            return 1
+
+    if subcommand == "rollback":
+        cp_id = getattr(args, "checkpoint_id", "")
+        if not cp_id:
+            console.error("Missing checkpoint ID.")
+            return 1
+        try:
+            res = cpm.rollback(cp_id, force=getattr(args, "confirm", False))
+            console.header(f"Rollback Checkpoint {cp_id}")
+            console.write(f"Restored ({len(res.restored)}): {', '.join(res.restored) or 'none'}")
+            console.write(f"Removed ({len(res.removed)}): {', '.join(res.removed) or 'none'}")
+            if res.preserved:
+                console.warn(f"Preserved due to conflicts ({len(res.preserved)}): {', '.join(res.preserved)}")
+            return 0 if res.ok else 1
+        except Exception as exc:
+            console.error(f"Rollback error: {exc}")
+            return 1
+
+    return 0
+
+
+def cmd_git(args: argparse.Namespace, settings: Settings, console: Console) -> int:
+    workspace = Workspace(settings.project_root)
+    git_svc = GitService(workspace)
+
+    subcommand = getattr(args, "git_subcommand", None) or "status"
+
+    if subcommand == "status":
+        info = asyncio.run(git_svc.status())
+        if not info["has_git"]:
+            console.write("Not a git repository.")
+            return 0
+        console.header(f"Git Status ({info['branch']})")
+        if info["clean"]:
+            console.write("Working tree clean.")
+        else:
+            for entry in info["status"]:
+                console.write(f"  {entry['state']} {entry['path']}")
+        return 0
+
+    if subcommand == "diff":
+        path_arg = getattr(args, "path", None)
+        info = asyncio.run(git_svc.diff(path_arg))
+        if not info["has_git"]:
+            console.write("Not a git repository.")
+            return 0
+        console.write(info["diff"] or "(no diff)")
+        return 0
+
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

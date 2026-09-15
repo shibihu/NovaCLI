@@ -63,6 +63,8 @@ class AgentSession:
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     model: str = ""
+    checkpoint_id: str | None = None
+    changed_files: list[dict[str, Any]] = field(default_factory=list)
     subscribers: list[asyncio.Queue[dict[str, Any]]] = field(default_factory=list, repr=False)
     run_task: asyncio.Task[Any] | None = field(default=None, repr=False)
 
@@ -113,6 +115,8 @@ class AgentSession:
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "pending_approval_id": self.pending_approval_id,
+            "checkpoint_id": self.checkpoint_id,
+            "changed_files": self.changed_files,
             "result": self.result.to_dict() if self.result else None,
         }
         if include_events:
@@ -197,17 +201,23 @@ class SessionRegistry:
             # The agent itself emits AGENT_START, so we do not synthesise one.
             async for event in agent.stream(session.task, controller=session.controller):
                 session.publish(event)
-                if event.type == EventType.APPROVAL_REQUEST:
+                if event.type == EventType.AGENT_START:
+                    session.checkpoint_id = event.data.get("checkpoint_id")
+                elif event.type == EventType.APPROVAL_REQUEST:
                     session.status = AgentStatus.WAITING_APPROVAL
                 elif event.type == EventType.APPROVAL_RESOLVED:
                     session.status = AgentStatus.RUNNING
                 elif event.type == EventType.FINAL:
                     session.status = AgentStatus.DONE
+                    session.checkpoint_id = str(event.data.get("checkpoint_id", "") or session.checkpoint_id or "")
+                    session.changed_files = list(event.data.get("changed_files") or [])
                     session.result = AgentResult(
                         task=session.task,
                         status=AgentStatus.DONE,
                         answer=str(event.data.get("answer", "")),
                         model=session.model,
+                        checkpoint_id=session.checkpoint_id,
+                        changed_files=session.changed_files,
                     )
                 elif event.type == EventType.ERROR:
                     session.status = AgentStatus.ERROR

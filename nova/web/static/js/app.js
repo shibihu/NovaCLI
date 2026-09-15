@@ -208,7 +208,17 @@
 
       case "final":
         $("approval-modal").classList.add("hidden");
-        agentMessage("Nova", renderMarkdown(data.answer || "(no answer)"));
+        let finalHtml = renderMarkdown(data.answer || "(no answer)");
+        if (data.checkpoint_id) {
+          const changed = data.changed_files || [];
+          finalHtml += '<div class="checkpoint-box" style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">' +
+                       '<div><strong>Checkpoint:</strong> <code>' + esc(data.checkpoint_id) + '</code> <span class="muted">(' + changed.length + ' changed files)</span></div>' +
+                       '<div style="margin-top: 8px; display: flex; gap: 8px;">' +
+                       '<button type="button" class="btn btn-ghost btn-view-diff" data-cp="' + esc(data.checkpoint_id) + '">View Diff</button>' +
+                       '<button type="button" class="btn btn-danger btn-undo-cp" data-cp="' + esc(data.checkpoint_id) + '">Undo Changes</button>' +
+                       '</div></div>';
+        }
+        agentMessage("Nova", finalHtml);
         setProgress(100);
         setBusy(false);
         break;
@@ -655,4 +665,52 @@
   }
 
   boot();
+
+
+
+  // Checkpoint & Diff Modal Event Listeners
+  const msgContainer = $("messages");
+  if (msgContainer) {
+    msgContainer.addEventListener("click", async (evt) => {
+      const diffBtn = evt.target.closest(".btn-view-diff");
+      if (diffBtn) {
+        const cpId = diffBtn.getAttribute("data-cp");
+        try {
+          const res = await apiGET("/api/git/diff");
+          $("diff-meta").textContent = "Diff for checkpoint " + cpId;
+          $("diff-content").textContent = res.diff || "(no diff)";
+          $("diff-modal").classList.remove("hidden");
+        } catch (err) {
+          toast("Error fetching diff: " + err.message);
+        }
+        return;
+      }
+
+      const undoBtn = evt.target.closest(".btn-undo-cp");
+      if (undoBtn) {
+        const cpId = undoBtn.getAttribute("data-cp");
+        if (!confirm("Are you sure you want to undo all changes for checkpoint " + cpId + "?")) {
+          return;
+        }
+        try {
+          const res = await apiPOST("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { confirm: true });
+          let msg = "Rollback complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
+          if (res.preserved && res.preserved.length > 0) {
+            msg += " (" + res.preserved.length + " files preserved due to user conflicts)";
+          }
+          toast(msg);
+        } catch (err) {
+          toast("Undo failed: " + err.message);
+        }
+      }
+    });
+  }
+
+  const diffCloseBtn = $("diff-close");
+  if (diffCloseBtn) {
+    diffCloseBtn.addEventListener("click", () => {
+      $("diff-modal").classList.add("hidden");
+    });
+  }
+
 })();
