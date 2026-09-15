@@ -68,6 +68,19 @@ class WriteBody(BaseModel):
     content: str = Field(max_length=2_000_000)
 
 
+class RenameBody(BaseModel):
+    """Body of ``POST /api/file/rename``."""
+
+    old_path: str = Field(min_length=1, max_length=1_000)
+    new_path: str = Field(min_length=1, max_length=1_000)
+
+
+class MkdirBody(BaseModel):
+    """Body of ``POST /api/file/mkdir``."""
+
+    path: str = Field(min_length=1, max_length=1_000)
+
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -415,6 +428,172 @@ async def agent_cancel(request: Request, body: SessionBody) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Extended Workspace & Developer APIs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/search")
+async def search_files(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=1_000),
+    glob: str | None = Query(None, max_length=200),
+    case_sensitive: bool = Query(False),
+    regex: bool = Query(False),
+) -> dict[str, Any]:
+    """Project-wide text search."""
+    workspace = _workspace(_settings(request))
+    try:
+        hits = workspace.search(
+            query=q,
+            glob=glob,
+            case_sensitive=case_sensitive,
+            regex=regex,
+        )
+        return {"query": q, "hits": [hit.to_dict() for hit in hits]}
+    except (OSError, ValueError, SafetyError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.delete("/api/file")
+async def delete_file(
+    request: Request,
+    path: str = Query(..., min_length=1, max_length=1_000),
+) -> dict[str, Any]:
+    """Delete a file within workspace safely."""
+    workspace = _workspace(_settings(request))
+    try:
+        deleted = workspace.delete(path)
+        if not deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"File {path!r} not found")
+        return {"ok": True, "path": path}
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError, IsADirectoryError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.post("/api/file/rename")
+async def rename_file(request: Request, body: RenameBody) -> dict[str, Any]:
+    """Rename/move a file safely within workspace."""
+    workspace = _workspace(_settings(request))
+    try:
+        old_target = workspace.resolve(body.old_path, for_write=True)
+        new_target = workspace.resolve(body.new_path, for_write=True)
+
+        if not old_target.exists():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Path {body.old_path!r} not found")
+        if new_target.exists():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Target {body.new_path!r} already exists")
+
+        new_target.parent.mkdir(parents=True, exist_ok=True)
+        old_target.rename(new_target)
+        return {"ok": True, "old_path": workspace.relative(old_target), "new_path": workspace.relative(new_target)}
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.post("/api/file/mkdir")
+async def mkdir(request: Request, body: MkdirBody) -> dict[str, Any]:
+    """Create a directory safely within workspace."""
+    workspace = _workspace(_settings(request))
+    try:
+        target = workspace.resolve(body.path, for_write=True)
+        target.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": workspace.relative(target)}
+    except SafetyError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.get("/api/git/status")
+async def git_status(request: Request) -> dict[str, Any]:
+    """Return basic git branch and status summary if repository exists."""
+    settings = _settings(request)
+    safety = _safety(settings)
+    runner = CommandRunner(settings.project_root, timeout=10, safety=safety)
+
+    if not (settings.project_root / ".git").exists():
+        return {"has_git": False, "branch": "", "status": [], "clean": True}
+
+    res_branch = await runner.run("git rev-parse --abbrev-ref HEAD", check_safety=False)
+    branch = res_branch.stdout.strip() if res_branch.exit_code == 0 else ""
+
+    res_status = await runner.run("git status --porcelain", check_safety=False)
+    raw_status = res_status.stdout.strip().splitlines() if res_status.exit_code == 0 else []
+
+    status_entries = []
+    for line in raw_status:
+        if len(line) >= 3:
+            xy = line[:2]
+            p = line[3:].strip()
+            status_entries.append({"state": xy, "path": p})
+
+    return {
+        "has_git": True,
+        "branch": branch,
+        "status": status_entries,
+        "clean": len(status_entries) == 0,
+    }
+
+
+@router.get("/api/git/diff")
+async def git_diff(
+    request: Request,
+    path: str | None = Query(None, max_length=1_000),
+) -> dict[str, Any]:
+    """Return git diff for a file or entire repository."""
+    settings = _settings(request)
+    safety = _safety(settings)
+    runner = CommandRunner(settings.project_root, timeout=15, safety=safety)
+
+    if not (settings.project_root / ".git").exists():
+        return {"has_git": False, "diff": ""}
+
+    cmd = "git diff"
+    if path:
+        workspace = _workspace(settings)
+        rel_path = workspace.relative(path)
+        cmd = f"git diff -- {rel_path}"
+
+    res = await runner.run(cmd, check_safety=False)
+    return {
+        "has_git": True,
+        "path": path,
+        "diff": res.stdout if res.exit_code == 0 else "",
+    }
+
+
+@router.post("/api/tests/run")
+async def run_tests(request: Request) -> dict[str, Any]:
+    """Discover and safely execute detected project test command."""
+    settings = _settings(request)
+    workspace = _workspace(settings)
+    analyzer = ProjectAnalyzer(workspace)
+    commands = analyzer.detect_commands()
+    test_cmd = commands.get("test")
+
+    if not test_cmd:
+        return {"ok": False, "error": "No test runner command detected for this project.", "output": ""}
+
+    safety = _safety(settings)
+    runner = CommandRunner(settings.project_root, timeout=60, safety=safety)
+    res = await runner.run(test_cmd, check_safety=False)
+
+    out = res.stdout + ("\n" + res.stderr if res.stderr else "")
+    return {
+        "ok": res.exit_code == 0,
+        "command": test_cmd,
+        "exit_code": res.exit_code,
+        "output": out,
+        "duration_ms": res.duration_ms,
+    }
+
+
 # Error handling
 # ---------------------------------------------------------------------------
 
