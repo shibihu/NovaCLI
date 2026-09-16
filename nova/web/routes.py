@@ -90,7 +90,8 @@ class CheckpointCreateBody(BaseModel):
 
 
 class RollbackBody(BaseModel):
-    confirm: bool = False
+    session_id: str | None = None
+    confirm: bool = True
 
 
 class MkdirBody(BaseModel):
@@ -573,21 +574,30 @@ async def git_commit_preview(request: Request) -> dict[str, Any]:
 
 
 @router.get("/api/agent/checkpoints")
-async def list_checkpoints(request: Request) -> dict[str, Any]:
-    """List all agent checkpoints in workspace."""
+async def list_checkpoints(
+    request: Request,
+    session_id: str | None = Query(None, max_length=64),
+) -> dict[str, Any]:
+    """List all agent checkpoints in workspace for session."""
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
-    cps = cpm.list()
+    cps = cpm.list(session_id=session_id)
     return {"checkpoints": [cp.to_dict() for cp in cps]}
 
 
 @router.get("/api/agent/checkpoint/{checkpoint_id}")
-async def get_checkpoint(request: Request, checkpoint_id: str) -> dict[str, Any]:
+async def get_checkpoint(
+    request: Request,
+    checkpoint_id: str,
+    session_id: str | None = Query(None, max_length=64),
+) -> dict[str, Any]:
     """Inspect details and changed files for a checkpoint."""
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
     try:
-        return cpm.inspect(checkpoint_id)
+        return cpm.inspect(checkpoint_id, session_id=session_id)
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except ValueError as exc:
@@ -610,10 +620,12 @@ async def rollback_checkpoint(
     """Safely rollback workspace state to a checkpoint baseline."""
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
-    confirm = body.confirm if body else False
+    session_id = body.session_id if body else None
     try:
-        res = cpm.rollback(checkpoint_id, force=confirm)
+        res = cpm.rollback(checkpoint_id, session_id=session_id)
         return res.to_dict()
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except ValueError as exc:
@@ -621,16 +633,23 @@ async def rollback_checkpoint(
 
 
 @router.delete("/api/agent/checkpoint/{checkpoint_id}")
-async def delete_checkpoint(request: Request, checkpoint_id: str) -> dict[str, Any]:
+async def delete_checkpoint(
+    request: Request,
+    checkpoint_id: str,
+    session_id: str | None = Query(None, max_length=64),
+) -> dict[str, Any]:
     """Delete a checkpoint record and its snapshots."""
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
-    deleted = cpm.delete(checkpoint_id)
-    if not deleted:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, f"Checkpoint {checkpoint_id!r} not found"
-        )
-    return {"ok": True, "checkpoint_id": checkpoint_id}
+    try:
+        deleted = cpm.delete(checkpoint_id, session_id=session_id)
+        if not deleted:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"Checkpoint {checkpoint_id!r} not found"
+            )
+        return {"ok": True, "checkpoint_id": checkpoint_id}
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
 
 @router.post("/api/tests/run")

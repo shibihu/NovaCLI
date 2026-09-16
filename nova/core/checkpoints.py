@@ -10,6 +10,7 @@ Key principles:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -19,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nova.core.git import GitService
 from nova.core.models import to_jsonable, utc_now_iso
 from nova.core.safety import (
     SENSITIVE_FILENAMES,
@@ -75,6 +77,7 @@ class CheckpointFile:
 class Checkpoint:
     id: str
     task_id: str
+    session_id: str | None = None
     created_at: str = field(default_factory=utc_now_iso)
     root: str = ""
     files: list[CheckpointFile] = field(default_factory=list)
@@ -104,8 +107,9 @@ class CheckpointManager:
 
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
-        self.root = workspace.root
+        self.root = workspace.root.resolve()
         self.checkpoints_dir = self.root / ".nova" / "checkpoints"
+        self.git_svc = GitService(self.workspace)
         self._ensure_storage()
 
     def _ensure_storage(self) -> None:
@@ -121,45 +125,49 @@ class CheckpointManager:
 
     def _validate_id(self, checkpoint_id: str) -> str:
         clean_id = (checkpoint_id or "").strip()
-        if not clean_id or not _VALID_ID_RE.match(clean_id):
+        if not clean_id or not _VALID_ID_RE.match(clean_id) or ".." in clean_id:
             raise ValueError(f"Invalid checkpoint ID: {checkpoint_id!r}")
         return clean_id
 
     def _get_user_dirty_files(self) -> list[str]:
-        """Collect paths dirty before the Agent starts to protect user changes."""
+        """Collect paths dirty before the Agent starts using GitService."""
         dirty: set[str] = set()
-        git_dir = self.root / ".git"
-        if git_dir.exists():
+        if self.git_svc.is_repo():
             try:
-                import subprocess
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
 
-                out = subprocess.check_output(
-                    ["git", "status", "--porcelain"],
-                    cwd=self.root,
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                )
-                for line in out.splitlines():
-                    if len(line) >= 3:
-                        p = line[3:].strip()
-                        if p and not is_sensitive_path(p):
-                            dirty.add(p)
+                if loop and loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        st = pool.submit(lambda: asyncio.run(self.git_svc.status())).result()
+                else:
+                    st = asyncio.run(self.git_svc.status())
+
+                for entry in st.get("status", []):
+                    p = entry.get("path", "").strip()
+                    if p and not is_sensitive_path(p):
+                        dirty.add(p)
             except Exception:
                 pass
         return sorted(dirty)
 
     def _get_git_head(self) -> str | None:
-        git_dir = self.root / ".git"
-        if git_dir.exists():
+        if self.git_svc.is_repo():
             try:
-                import subprocess
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
 
-                return subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=self.root,
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                ).strip()
+                if loop and loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        return pool.submit(lambda: asyncio.run(self.git_svc.current_branch())).result()
+                else:
+                    return asyncio.run(self.git_svc.current_branch())
             except Exception:
                 return None
         return None
@@ -188,7 +196,6 @@ class CheckpointManager:
                 chash = _file_hash(content)
                 is_dirty = rel_path in user_dirty
 
-                # Snapshot file text/bytes if size <= 1MB
                 if file_path.stat().st_size <= 1_000_000:
                     snap_target = snapshots_dir / rel_path
                     snap_target.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +218,7 @@ class CheckpointManager:
         checkpoint = Checkpoint(
             id=cp_id,
             task_id=task_id,
+            session_id=session_id,
             created_at=utc_now_iso(),
             root=str(self.root),
             files=files,
@@ -227,8 +235,8 @@ class CheckpointManager:
 
         return checkpoint
 
-    def get(self, checkpoint_id: str) -> Checkpoint | None:
-        """Retrieve a checkpoint by ID."""
+    def get(self, checkpoint_id: str, session_id: str | None = None) -> Checkpoint | None:
+        """Retrieve a checkpoint by ID enforcing session and workspace ownership."""
         try:
             cp_id = self._validate_id(checkpoint_id)
         except ValueError:
@@ -242,40 +250,57 @@ class CheckpointManager:
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             meta = data.get("metadata", {})
+            stored_session = data.get("session_id") or meta.get("session_id")
+
+            # Workspace root verification
+            cp_root = meta.get("root", "")
+            if cp_root and Path(cp_root).resolve() != self.root:
+                return None
+
+            # Session ownership verification
+            if session_id and stored_session and stored_session != session_id:
+                raise PermissionError(f"Session {session_id!r} cannot access checkpoint {checkpoint_id!r} belonging to session {stored_session!r}")
+
             files = [CheckpointFile(**f) for f in meta.get("files", [])]
             return Checkpoint(
                 id=meta.get("id", cp_id),
                 task_id=meta.get("task_id", ""),
+                session_id=stored_session,
                 created_at=meta.get("created_at", ""),
-                root=meta.get("root", str(self.root)),
+                root=cp_root or str(self.root),
                 files=files,
                 user_dirty_files=meta.get("user_dirty_files", []),
                 git_head=meta.get("git_head"),
                 status=meta.get("status", "active"),
             )
+        except PermissionError:
+            raise
         except (json.JSONDecodeError, OSError, TypeError):
             return None
 
-    def list(self) -> list[Checkpoint]:
-        """List all available checkpoints for this workspace."""
+    def list(self, session_id: str | None = None) -> list[Checkpoint]:
+        """List all available checkpoints for this workspace/session."""
         cps: list[Checkpoint] = []
         if not self.checkpoints_dir.exists():
             return cps
 
         for item in self.checkpoints_dir.iterdir():
             if item.is_dir() and (item / "manifest.json").exists():
-                cp = self.get(item.name)
-                if cp:
-                    cps.append(cp)
+                try:
+                    cp = self.get(item.name, session_id=session_id)
+                    if cp:
+                        cps.append(cp)
+                except PermissionError:
+                    continue
 
         cps.sort(key=lambda c: c.created_at, reverse=True)
         return cps
 
-    def inspect(self, checkpoint_id: str) -> dict[str, Any]:
+    def inspect(self, checkpoint_id: str, session_id: str | None = None) -> dict[str, Any]:
         """Compare current workspace against checkpoint to list changed files."""
-        cp = self.get(checkpoint_id)
+        cp = self.get(checkpoint_id, session_id=session_id)
         if cp is None:
-            raise KeyError(f"Checkpoint {checkpoint_id!r} not found")
+            raise KeyError(f"Checkpoint {checkpoint_id!r} not found or inaccessible")
 
         cp_files = {f.path: f for f in cp.files}
         user_dirty = set(cp.user_dirty_files)
@@ -335,22 +360,30 @@ class CheckpointManager:
         return {
             "checkpoint_id": cp.id,
             "task_id": cp.task_id,
+            "session_id": cp.session_id,
             "created_at": cp.created_at,
             "changed_files": changes,
             "total_changes": len(changes),
         }
 
-    def rollback(self, checkpoint_id: str, *, force: bool = False) -> RollbackResult:
-        """Safely restore workspace state to checkpoint baseline."""
+    def rollback(self, checkpoint_id: str, *, session_id: str | None = None) -> RollbackResult:
+        """Safely restore workspace state to checkpoint baseline.
+
+        NEVER overwrites or deletes pre-existing user-owned files.
+        """
         cp_id = self._validate_id(checkpoint_id)
-        cp = self.get(cp_id)
+        cp = self.get(cp_id, session_id=session_id)
         if cp is None:
-            raise KeyError(f"Checkpoint {cp_id!r} not found")
+            raise KeyError(f"Checkpoint {cp_id!r} not found or inaccessible")
 
-        cp_dir = self.checkpoints_dir / cp_id
-        snapshots_dir = cp_dir / "snapshots"
+        cp_dir = (self.checkpoints_dir / cp_id).resolve()
+        snapshots_dir = (cp_dir / "snapshots").resolve()
 
-        inspection = self.inspect(cp_id)
+        # Storage directory jail check
+        if self.checkpoints_dir not in cp_dir.parents and cp_dir != self.checkpoints_dir:
+            raise SafetyError("Checkpoint directory is outside storage root", None)
+
+        inspection = self.inspect(cp_id, session_id=session_id)
         changed_files = inspection["changed_files"]
 
         restored: list[str] = []
@@ -374,23 +407,37 @@ class CheckpointManager:
                 preserved.append(rel_path)
                 continue
 
-            if is_user_owned and not force:
+            # INVIOLABLE SECURITY RULE: Pre-existing user-owned files are NEVER touched
+            if is_user_owned:
                 preserved.append(f"{rel_path} (preserved_due_to_ownership_conflict)")
                 continue
 
             if status == "created":
-                if target.exists() and target.is_file():
+                if target.exists() or target.is_symlink():
                     try:
-                        target.unlink()
+                        if target.is_dir() and not target.is_symlink():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
                         removed.append(rel_path)
                     except OSError as exc:
                         errors.append(f"Failed to remove {rel_path}: {exc}")
                         preserved.append(rel_path)
 
             elif status in ("modified", "deleted"):
-                snap_file = snapshots_dir / rel_path
-                if snap_file.exists():
+                snap_file = (snapshots_dir / rel_path).resolve()
+
+                # Ensure snapshot path stays inside snapshots_dir
+                if snapshots_dir not in snap_file.parents and snap_file != snapshots_dir:
+                    errors.append(f"Snapshot path traversal attempt blocked for {rel_path}")
+                    preserved.append(rel_path)
+                    continue
+
+                if snap_file.exists() and snap_file.is_file():
                     try:
+                        # Symlink safety: if target is a symlink, unlink it first so copy2 writes file, not through symlink
+                        if target.is_symlink():
+                            target.unlink()
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(snap_file, target)
                         restored.append(rel_path)
@@ -410,15 +457,18 @@ class CheckpointManager:
             errors=errors,
         )
 
-    def delete(self, checkpoint_id: str) -> bool:
+    def delete(self, checkpoint_id: str, session_id: str | None = None) -> bool:
         """Delete a checkpoint record and its snapshots."""
         try:
             cp_id = self._validate_id(checkpoint_id)
-        except ValueError:
+            cp = self.get(cp_id, session_id=session_id)
+            if cp is None:
+                return False
+        except (ValueError, PermissionError):
             return False
 
-        cp_dir = self.checkpoints_dir / cp_id
-        if cp_dir.exists() and cp_dir.is_dir():
+        cp_dir = (self.checkpoints_dir / cp_id).resolve()
+        if self.checkpoints_dir in cp_dir.parents and cp_dir.exists() and cp_dir.is_dir():
             shutil.rmtree(cp_dir, ignore_errors=True)
             return True
         return False
