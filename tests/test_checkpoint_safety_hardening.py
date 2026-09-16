@@ -13,6 +13,7 @@ from nova.config import load_settings
 from nova.core.checkpoints import CheckpointManager
 from nova.core.git import GitService
 from nova.web.app import create_app
+from nova.core.safety import SafetyError
 from nova.workspace.files import Workspace
 
 
@@ -241,10 +242,8 @@ def test_tampered_manifest_path_is_rejected(tmp_path: Path):
     })
     manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    # get() must filter out the malicious path
-    cp_loaded = cpm.get(cp.id)
-    assert cp_loaded is not None
-    assert not any("../../etc/passwd" in f.path for f in cp_loaded.files)
+    # get() must reject the tampered manifest completely
+    assert cpm.get(cp.id) is None
 
 
 def test_cross_workspace_checkpoint_access_blocked(tmp_path: Path):
@@ -400,11 +399,167 @@ def test_manifest_schema_validation(tmp_path: Path):
     # Test malformed non-list files
     manifest_path.write_text(json.dumps({"metadata": {"files": "not_a_list"}}), encoding="utf-8")
     cp_loaded = cpm.get(cp.id)
-    assert cp_loaded is not None
-    assert cp_loaded.files == []
+    assert cp_loaded is None
 
     # Test malformed file entry (non-dict item)
     manifest_path.write_text(json.dumps({"metadata": {"files": ["not_a_dict"]}}), encoding="utf-8")
     cp_loaded2 = cpm.get(cp.id)
-    assert cp_loaded2 is not None
-    assert cp_loaded2.files == []
+    assert cp_loaded2 is None
+
+
+# ---------------------------------------------------------------------------
+# 8. Storage-Root Symlink & Strict Manifest Validation Tests (PR #24.1)
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_storage_root_cannot_escape_via_nova_symlink(tmp_path: Path):
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    outside_dir = tmp_path / "outside_nova"
+    outside_dir.mkdir()
+
+    nova_symlink = ws_dir / ".nova"
+    try:
+        os.symlink(outside_dir, nova_symlink)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported")
+
+    ws = Workspace(ws_dir)
+    with pytest.raises(SafetyError):
+        CheckpointManager(ws)
+
+
+def test_checkpoint_storage_root_cannot_escape_via_checkpoints_symlink(tmp_path: Path):
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    nova_dir = ws_dir / ".nova"
+    nova_dir.mkdir()
+    outside_dir = tmp_path / "outside_cps"
+    outside_dir.mkdir()
+
+    cp_symlink = nova_dir / "checkpoints"
+    try:
+        os.symlink(outside_dir, cp_symlink)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported")
+
+    ws = Workspace(ws_dir)
+    with pytest.raises(SafetyError):
+        CheckpointManager(ws)
+
+
+def test_manifest_rejects_invalid_state_type(tmp_path: Path):
+    (tmp_path / "app.py").write_text("code", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="state_type_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["files"][0]["state"] = 123
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_boolean_types(tmp_path: Path):
+    (tmp_path / "app.py").write_text("code", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="bool_type_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["files"][0]["is_user_owned"] = "false"
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_hash_types(tmp_path: Path):
+    (tmp_path / "app.py").write_text("code", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="hash_type_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["files"][0]["before_hash"] = 12345
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_required_fields(tmp_path: Path):
+    (tmp_path / "app.py").write_text("code", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="req_fields_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    del data["metadata"]["files"][0]["state"]
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_files_list_structure(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="files_list_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["files"] = "not_a_list"
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_user_dirty_files_structure(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="dirty_structure_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["user_dirty_files"] = {"invalid": "dict"}
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_rejects_invalid_toplevel_fields(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="toplevel_type_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    data["metadata"]["id"] = 99999
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cpm.get(cp.id) is None
+
+
+def test_manifest_preserves_legitimate_existing_manifests(tmp_path: Path):
+    (tmp_path / "hello.py").write_text("print('hello')", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+
+    cp = cpm.create(task_id="valid_test")
+    loaded = cpm.get(cp.id)
+
+    assert loaded is not None
+    assert loaded.id == cp.id
+    assert loaded.task_id == "valid_test"
+    assert len(loaded.files) == 1
+    assert loaded.files[0].path == "hello.py"
