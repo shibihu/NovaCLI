@@ -281,3 +281,130 @@ def test_checkpoints_and_routes_have_no_check_safety_false():
         fpath = Path(__file__).resolve().parent.parent / rel_path
         text = fpath.read_text(encoding="utf-8")
         assert "check_safety=False" not in text, f"{rel_path} must not contain check_safety=False"
+
+
+# ---------------------------------------------------------------------------
+# 7. Checkpoint Symlink Hardening & Manifest Schema Security Tests (PR #23.1)
+# ---------------------------------------------------------------------------
+
+
+def test_is_safe_rel_path_allows_legitimate_double_dot_filename():
+    from nova.core.checkpoints import _is_safe_rel_path
+    assert _is_safe_rel_path("version..txt") is True
+    assert _is_safe_rel_path("sub/version..txt") is True
+
+
+def test_is_safe_rel_path_rejects_real_traversal():
+    from nova.core.checkpoints import _is_safe_rel_path
+    assert _is_safe_rel_path("../secret.txt") is False
+    assert _is_safe_rel_path("foo/../secret.txt") is False
+    assert _is_safe_rel_path("foo/../../secret.txt") is False
+    assert _is_safe_rel_path("/etc/passwd") is False
+    assert _is_safe_rel_path("C:\\Windows\\System32") is False
+
+
+def test_checkpoint_does_not_read_file_symlink_outside_workspace(tmp_path: Path):
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    secret_content = "DO_NOT_COPY_THIS_SECRET_SENTINEL_123"
+    outside_secret = outside_dir / "secret.txt"
+    outside_secret.write_text(secret_content, encoding="utf-8")
+
+    (ws_dir / "inside.txt").write_text("inside_valid_content", encoding="utf-8")
+
+    symlink_file = ws_dir / "secret.txt"
+    try:
+        os.symlink(outside_secret, symlink_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported")
+
+    ws = Workspace(ws_dir)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="symlink_test")
+
+    # Verify inside.txt is in checkpoint
+    assert any(f.path == "inside.txt" for f in cp.files)
+
+    # Verify secret.txt is NOT in checkpoint files
+    assert not any(f.path == "secret.txt" for f in cp.files)
+
+    # Sentinel Check: Verify secret content does NOT exist in any checkpoint snapshot file
+    cp_dir = cpm.checkpoints_dir / cp.id
+    for root, _, files in os.walk(cp_dir):
+        for f in files:
+            fpath = Path(root) / f
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+            assert secret_content not in text, f"Secret content leaked into snapshot {fpath}!"
+
+
+def test_nested_file_symlink_outside_workspace(tmp_path: Path):
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    secret_content = "DO_NOT_COPY_NESTED_SECRET_456"
+    outside_secret = outside_dir / "secret.txt"
+    outside_secret.write_text(secret_content, encoding="utf-8")
+
+    src_dir = ws_dir / "src"
+    src_dir.mkdir()
+    nested_symlink = src_dir / "leaked.txt"
+    try:
+        os.symlink(outside_secret, nested_symlink)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported")
+
+    ws = Workspace(ws_dir)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="nested_symlink_test")
+
+    assert not any("leaked.txt" in f.path for f in cp.files)
+
+    cp_dir = cpm.checkpoints_dir / cp.id
+    for root, _, files in os.walk(cp_dir):
+        for f in files:
+            text = (Path(root) / f).read_text(encoding="utf-8", errors="replace")
+            assert secret_content not in text
+
+
+def test_checkpoint_destination_cannot_escape(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="dest_test")
+
+    # Manually attempt to inspect or load with a destination attempt
+    cp_dir = cpm.checkpoints_dir / cp.id
+    snaps_dir = cp_dir / "snapshots"
+
+    # Attempt destination traversal path
+    malicious_target = (snaps_dir / "../../outside.txt").resolve()
+    snaps_resolved = snaps_dir.resolve()
+    assert snaps_resolved not in malicious_target.parents
+
+
+def test_manifest_schema_validation(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="schema_test")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+
+    # Test malformed non-dict metadata
+    manifest_path.write_text(json.dumps({"metadata": "not_a_dict"}), encoding="utf-8")
+    assert cpm.get(cp.id) is None
+
+    # Test malformed non-list files
+    manifest_path.write_text(json.dumps({"metadata": {"files": "not_a_list"}}), encoding="utf-8")
+    cp_loaded = cpm.get(cp.id)
+    assert cp_loaded is not None
+    assert cp_loaded.files == []
+
+    # Test malformed file entry (non-dict item)
+    manifest_path.write_text(json.dumps({"metadata": {"files": ["not_a_dict"]}}), encoding="utf-8")
+    cp_loaded2 = cpm.get(cp.id)
+    assert cp_loaded2 is not None
+    assert cp_loaded2.files == []

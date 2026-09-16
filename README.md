@@ -409,6 +409,7 @@ NovaCLI supports two command execution backends:
 NovaCLI automatically captures recovery checkpoints before/during Agent tasks:
 - **Checkpoints**: Stored under `.nova/checkpoints/` (ignored by Git). Snapshots text files without copying sensitive credentials (`.env`, keys).
 - **Inviolable User Ownership Protection**: Pre-existing user uncommitted changes are tracked and strictly preserved during rollbacks. `confirm` authorizes the rollback operation but never overwrites or deletes pre-existing user-owned files.
+- **Snapshot Symlink & Path Hardening**: Checkpoint snapshot creation skips file symlinks, enforces canonical workspace containment before reads, and validates manifest paths using component-based traversal rules.
 - **Session & Workspace Context Enforcement**: Checkpoint operations verify session ID and workspace root context to prevent cross-session or cross-workspace checkpoint tampering.
 - **Centralized Execution**: All Git operations in CheckpointManager use centralized `GitService` and `CommandRunner.run_args()` without direct `subprocess` calls or shell invocation.
 - **Diff Review**: Inspect changed files, added/removed lines, and unified diffs before accepting or undoing changes.

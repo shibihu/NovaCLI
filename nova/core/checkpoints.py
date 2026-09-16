@@ -37,16 +37,18 @@ _VALID_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 def _is_safe_rel_path(path_str: str) -> bool:
     if not path_str or not isinstance(path_str, str):
         return False
-    clean = path_str.replace("\\", "/")
-    if ".." in clean or clean.startswith("/") or clean.startswith("\\"):
+    clean = path_str.replace("\\", "/").strip()
+    if not clean or clean.startswith("/") or clean.startswith("\\"):
         return False
     if len(clean) >= 2 and clean[1] == ":":
         return False
     if clean.startswith("//"):
         return False
+
+    p = Path(clean)
+    if ".." in p.parts:
+        return False
     return True
-
-
 def _file_hash(content: str | bytes) -> str:
     if isinstance(content, str):
         content = content.encode("utf-8")
@@ -199,18 +201,44 @@ class CheckpointManager:
         files: list[CheckpointFile] = []
         workspace_files = self.workspace.iter_files()
 
+        snapshots_dir_resolved = snapshots_dir.resolve()
+
         for file_path in workspace_files:
             rel_path = self.workspace.relative(file_path)
             if is_sensitive_path(rel_path):
                 continue
 
+            # Reject/skip file symlinks
+            if file_path.is_symlink():
+                continue
+
+            # Resolve canonical path and verify it is a regular file inside workspace root
             try:
-                content = file_path.read_bytes()
+                resolved_file = file_path.resolve()
+            except (OSError, ValueError):
+                continue
+
+            if not resolved_file.is_file():
+                continue
+
+            if self.root not in resolved_file.parents and resolved_file != self.root:
+                continue
+
+            # Verify destination snapshot path stays strictly inside snapshots_dir
+            try:
+                snap_target = (snapshots_dir / rel_path).resolve()
+            except (OSError, ValueError):
+                continue
+
+            if snapshots_dir_resolved not in snap_target.parents:
+                continue
+
+            try:
+                content = resolved_file.read_bytes()
                 chash = _file_hash(content)
                 is_dirty = rel_path in user_dirty
 
-                if file_path.stat().st_size <= 1_000_000:
-                    snap_target = snapshots_dir / rel_path
+                if resolved_file.stat().st_size <= 1_000_000:
                     snap_target.parent.mkdir(parents=True, exist_ok=True)
                     snap_target.write_bytes(content)
 
@@ -262,8 +290,15 @@ class CheckpointManager:
 
         try:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
             meta = data.get("metadata", {})
+            if not isinstance(meta, dict):
+                return None
+
             stored_session = data.get("session_id") or meta.get("session_id")
+            if stored_session is not None and not isinstance(stored_session, str):
+                stored_session = str(stored_session)
 
             # Workspace root verification
             cp_root = meta.get("root", "")
@@ -278,20 +313,46 @@ class CheckpointManager:
                     )
 
             files = []
-            for f in meta.get("files", []):
-                p = f.get("path") if isinstance(f, dict) else None
-                if p and _is_safe_rel_path(p):
-                    files.append(CheckpointFile(**f))
+            raw_files = meta.get("files", [])
+            if isinstance(raw_files, list):
+                for f in raw_files:
+                    if not isinstance(f, dict):
+                        continue
+                    p = f.get("path")
+                    if p and isinstance(p, str) and _is_safe_rel_path(p):
+                        state = str(f.get("state") or "clean")
+                        b_hash = str(f["before_hash"]) if f.get("before_hash") else None
+                        a_hash = str(f["after_hash"]) if f.get("after_hash") else None
+                        ex_before = bool(f.get("existed_before", True))
+                        ex_after = bool(f.get("existed_after", True))
+                        is_user = bool(f.get("is_user_owned", False))
+                        files.append(
+                            CheckpointFile(
+                                path=p,
+                                state=state,
+                                before_hash=b_hash,
+                                after_hash=a_hash,
+                                existed_before=ex_before,
+                                existed_after=ex_after,
+                                is_user_owned=is_user,
+                            )
+                        )
+
+            raw_user_dirty = meta.get("user_dirty_files", [])
+            user_dirty_files = [
+                str(p) for p in raw_user_dirty if isinstance(p, str) and _is_safe_rel_path(p)
+            ] if isinstance(raw_user_dirty, list) else []
+
             return Checkpoint(
-                id=meta.get("id", cp_id),
-                task_id=meta.get("task_id", ""),
+                id=str(meta.get("id", cp_id)),
+                task_id=str(meta.get("task_id", "")),
                 session_id=stored_session,
-                created_at=meta.get("created_at", ""),
+                created_at=str(meta.get("created_at", "")),
                 root=cp_root or str(self.root),
                 files=files,
-                user_dirty_files=meta.get("user_dirty_files", []),
-                git_head=meta.get("git_head"),
-                status=meta.get("status", "active"),
+                user_dirty_files=user_dirty_files,
+                git_head=str(meta["git_head"]) if meta.get("git_head") else None,
+                status=str(meta.get("status", "active")),
             )
         except PermissionError:
             raise
