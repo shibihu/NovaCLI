@@ -30,6 +30,15 @@ class GitService:
         """True if the workspace is inside a Git repository."""
         return (self.root / ".git").exists()
 
+    async def current_head(self) -> str | None:
+        """Return active Git commit SHA or None if not a repository/detached/unavailable."""
+        if not self.is_repo():
+            return None
+        res = await self.runner.run_args(
+            ["git", "rev-parse", "HEAD"], check_safety=True
+        )
+        return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
     async def current_branch(self) -> str:
         """Return active branch name or empty string if detached/unavailable."""
         if not self.is_repo():

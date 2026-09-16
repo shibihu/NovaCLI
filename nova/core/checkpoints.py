@@ -34,6 +34,19 @@ from nova.workspace.files import Workspace
 _VALID_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
 
+def _is_safe_rel_path(path_str: str) -> bool:
+    if not path_str or not isinstance(path_str, str):
+        return False
+    clean = path_str.replace("\\", "/")
+    if ".." in clean or clean.startswith("/") or clean.startswith("\\"):
+        return False
+    if len(clean) >= 2 and clean[1] == ":":
+        return False
+    if clean.startswith("//"):
+        return False
+    return True
+
+
 def _file_hash(content: str | bytes) -> str:
     if isinstance(content, str):
         content = content.encode("utf-8")
@@ -165,9 +178,9 @@ class CheckpointManager:
                 if loop and loop.is_running():
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor() as pool:
-                        return pool.submit(lambda: asyncio.run(self.git_svc.current_branch())).result()
+                        return pool.submit(lambda: asyncio.run(self.git_svc.current_head())).result()
                 else:
-                    return asyncio.run(self.git_svc.current_branch())
+                    return asyncio.run(self.git_svc.current_head())
             except Exception:
                 return None
         return None
@@ -257,11 +270,18 @@ class CheckpointManager:
             if cp_root and Path(cp_root).resolve() != self.root:
                 return None
 
-            # Session ownership verification
-            if session_id and stored_session and stored_session != session_id:
-                raise PermissionError(f"Session {session_id!r} cannot access checkpoint {checkpoint_id!r} belonging to session {stored_session!r}")
+            # Mandatory Session ownership verification
+            if stored_session:
+                if not session_id or session_id != stored_session:
+                    raise PermissionError(
+                        f"Session ownership mismatch: checkpoint {checkpoint_id!r} requires session {stored_session!r}"
+                    )
 
-            files = [CheckpointFile(**f) for f in meta.get("files", [])]
+            files = []
+            for f in meta.get("files", []):
+                p = f.get("path") if isinstance(f, dict) else None
+                if p and _is_safe_rel_path(p):
+                    files.append(CheckpointFile(**f))
             return Checkpoint(
                 id=meta.get("id", cp_id),
                 task_id=meta.get("task_id", ""),
@@ -425,7 +445,12 @@ class CheckpointManager:
                         preserved.append(rel_path)
 
             elif status in ("modified", "deleted"):
-                snap_file = (snapshots_dir / rel_path).resolve()
+                try:
+                    snap_file = (snapshots_dir / rel_path).resolve()
+                except Exception:
+                    errors.append(f"Invalid snapshot path for {rel_path}")
+                    preserved.append(rel_path)
+                    continue
 
                 # Ensure snapshot path stays inside snapshots_dir
                 if snapshots_dir not in snap_file.parents and snap_file != snapshots_dir:
@@ -435,7 +460,7 @@ class CheckpointManager:
 
                 if snap_file.exists() and snap_file.is_file():
                     try:
-                        # Symlink safety: if target is a symlink, unlink it first so copy2 writes file, not through symlink
+                        # Symlink safety: if target is a symlink, unlink it first so copy2 writes real file
                         if target.is_symlink():
                             target.unlink()
                         target.parent.mkdir(parents=True, exist_ok=True)

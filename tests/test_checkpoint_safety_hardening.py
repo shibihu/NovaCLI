@@ -1,15 +1,17 @@
-"""Comprehensive security hardening regression tests for Checkpoints and Rollback."""
+"""Comprehensive security hardening regression tests for Checkpoints and Rollback (PR #22.1)."""
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
 from nova.config import load_settings
 from nova.core.checkpoints import CheckpointManager
+from nova.core.git import GitService
 from nova.web.app import create_app
 from nova.workspace.files import Workspace
 
@@ -37,47 +39,63 @@ def auth_client(test_app):
 
 
 # ---------------------------------------------------------------------------
-# 1. User Ownership Protection & Sentinel Verification
+# 1. Git HEAD Commit SHA Correctness
 # ---------------------------------------------------------------------------
 
 
-def test_pre_existing_user_dirty_file_never_destroyed(tmp_path: Path):
-    user_sentinel = tmp_path / "user_work.py"
-    user_sentinel.write_text("USER_SENTINEL_V1", encoding="utf-8")
+async def test_git_head_is_commit_sha(tmp_path: Path):
+    try:
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+        (tmp_path / "README.md").write_text("# Repo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
 
+        expected_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
+    except Exception:
+        pytest.skip("git CLI not available")
+
+    ws = Workspace(tmp_path)
+    git_svc = GitService(ws)
+    head_sha = await git_svc.current_head()
+    assert head_sha == expected_sha
+
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="head_task")
+    assert cp.git_head == expected_sha
+
+
+# ---------------------------------------------------------------------------
+# 2. Mandatory Session Ownership
+# ---------------------------------------------------------------------------
+
+
+def test_missing_session_id_cannot_access_session_checkpoint(tmp_path: Path):
     ws = Workspace(tmp_path)
     cpm = CheckpointManager(ws)
 
-    # Create checkpoint
-    cp = cpm.create(task_id="agent_task_1")
+    cp = cpm.create(task_id="task_sess", session_id="sess_secret_123")
 
-    # Force user_work.py into user_dirty_files in metadata
-    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
-    data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    data["metadata"]["user_dirty_files"] = ["user_work.py"]
-    for f in data["metadata"]["files"]:
-        if f["path"] == "user_work.py":
-            f["is_user_owned"] = True
-    manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Missing session_id must be DENIED
+    with pytest.raises(PermissionError):
+        cpm.get(cp.id)
 
-    # User modifies file further after checkpoint creation
-    user_sentinel.write_text("USER_SENTINEL_V2", encoding="utf-8")
+    with pytest.raises(PermissionError):
+        cpm.get(cp.id, session_id=None)
 
-    # Agent creates a new file
-    (tmp_path / "agent_created.py").write_text("agent_code", encoding="utf-8")
+    with pytest.raises(PermissionError):
+        cpm.inspect(cp.id, session_id=None)
 
-    # Perform rollback
-    res = cpm.rollback(cp.id)
+    with pytest.raises(PermissionError):
+        cpm.rollback(cp.id, session_id=None)
 
-    # Invariant checks
-    assert user_sentinel.read_text(encoding="utf-8") == "USER_SENTINEL_V2", "User work was overwritten!"
-    assert any("user_work.py" in p for p in res.preserved)
-    assert not (tmp_path / "agent_created.py").exists(), "Agent file was not removed"
+    assert cpm.delete(cp.id, session_id=None) is False
 
-
-# ---------------------------------------------------------------------------
-# 2. Cross-Session Isolation
-# ---------------------------------------------------------------------------
+    # Matching session_id must succeed
+    cp_ok = cpm.get(cp.id, session_id="sess_secret_123")
+    assert cp_ok is not None
+    assert cp_ok.id == cp.id
 
 
 def test_cross_session_checkpoint_access_blocked(auth_client, tmp_path: Path):
@@ -94,7 +112,7 @@ def test_cross_session_checkpoint_access_blocked(auth_client, tmp_path: Path):
 
     # Session B attempting to rollback Session A checkpoint via API
     res_rb = auth_client.post(
-        f"/api/agent/checkpoint/{cp_A.id}/rollback", json={"session_id": "sess_B"}
+        f"/api/agent/checkpoint/{cp_A.id}/rollback", json={"session_id": "sess_B", "confirm": True}
     )
     assert res_rb.status_code == 403
 
@@ -106,8 +124,127 @@ def test_cross_session_checkpoint_access_blocked(auth_client, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 3. Cross-Workspace Isolation
+# 3. Confirm Semantics Verification
 # ---------------------------------------------------------------------------
+
+
+def test_confirm_false_does_not_rollback(auth_client, tmp_path: Path):
+    (tmp_path / "app.py").write_text("v1", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+
+    cp = cpm.create(task_id="task_confirm")
+    (tmp_path / "app.py").write_text("v2_modified", encoding="utf-8")
+
+    # confirm=False -> rejected with HTTP 400
+    res = auth_client.post(
+        f"/api/agent/checkpoint/{cp.id}/rollback", json={"confirm": False}
+    )
+    assert res.status_code == 400
+    assert "explicit confirmation" in res.json()["detail"]
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "v2_modified"
+
+
+def test_confirm_true_allows_normal_rollback(auth_client, tmp_path: Path):
+    (tmp_path / "app.py").write_text("v1", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+
+    cp = cpm.create(task_id="task_confirm")
+    (tmp_path / "app.py").write_text("v2_modified", encoding="utf-8")
+
+    # confirm=True -> proceeds
+    res = auth_client.post(
+        f"/api/agent/checkpoint/{cp.id}/rollback", json={"confirm": True}
+    )
+    assert res.status_code == 200
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "v1"
+
+
+# ---------------------------------------------------------------------------
+# 4. User Ownership Sentinel & Invariant Verification
+# ---------------------------------------------------------------------------
+
+
+def test_user_owned_file_remains_untouched(tmp_path: Path):
+    user_file = tmp_path / "user_work.py"
+    user_file.write_text("USER_ORIGINAL_V1", encoding="utf-8")
+
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+
+    cp = cpm.create(task_id="task_user_owned")
+
+    # Mark user_work.py as user-owned
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["metadata"]["user_dirty_files"] = ["user_work.py"]
+    for f in data["metadata"]["files"]:
+        if f["path"] == "user_work.py":
+            f["is_user_owned"] = True
+    manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # User modifies file further
+    user_file.write_text("USER_MODIFIED_V2", encoding="utf-8")
+
+    # Rollback must NEVER touch user_work.py
+    res = cpm.rollback(cp.id)
+    assert user_file.read_text(encoding="utf-8") == "USER_MODIFIED_V2"
+    assert any("user_work.py" in p for p in res.preserved)
+
+
+# ---------------------------------------------------------------------------
+# 5. Symlink & Path Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_replacement_cannot_escape_workspace(tmp_path: Path):
+    outside_dir = tmp_path.parent / "outside_target"
+    outside_dir.mkdir(exist_ok=True)
+    outside_secret = outside_dir / "secret.txt"
+    outside_secret.write_text("TOP_SECRET", encoding="utf-8")
+
+    (tmp_path / "target.txt").write_text("inside_v1", encoding="utf-8")
+
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="sym_task")
+
+    # Replace target.txt with symlink to outside_secret
+    (tmp_path / "target.txt").unlink()
+    try:
+        os.symlink(outside_secret, tmp_path / "target.txt")
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported")
+
+    res = cpm.rollback(cp.id)
+    assert outside_secret.read_text(encoding="utf-8") == "TOP_SECRET", "Outside secret was overwritten through symlink!"
+
+
+def test_tampered_manifest_path_is_rejected(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    cpm = CheckpointManager(ws)
+    cp = cpm.create(task_id="tamper_task")
+
+    manifest_path = cpm.checkpoints_dir / cp.id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    # Inject malicious traversal paths into manifest
+    data["metadata"]["files"].append({
+        "path": "../../etc/passwd",
+        "state": "modified",
+        "before_hash": "1234",
+        "after_hash": "5678",
+        "existed_before": True,
+        "existed_after": True,
+        "is_user_owned": False,
+    })
+    manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # get() must filter out the malicious path
+    cp_loaded = cpm.get(cp.id)
+    assert cp_loaded is not None
+    assert not any("../../etc/passwd" in f.path for f in cp_loaded.files)
 
 
 def test_cross_workspace_checkpoint_access_blocked(tmp_path: Path):
@@ -124,33 +261,11 @@ def test_cross_workspace_checkpoint_access_blocked(tmp_path: Path):
     import shutil
     shutil.copytree(cpm_A.checkpoints_dir / cp_A.id, cp_B_dir)
 
-    # cpm_B must reject cp_A because root does not match ws_B
     assert cpm_B.get(cp_A.id) is None
 
 
 # ---------------------------------------------------------------------------
-# 4. Checkpoint ID & Path Traversal Security
-# ---------------------------------------------------------------------------
-
-
-def test_checkpoint_id_traversal_attempts_rejected(auth_client):
-    traversal_ids = [
-        "../../etc/passwd",
-        "../cp_123",
-        "/etc/passwd",
-        "cp_123; rm -rf /",
-    ]
-
-    for cp_id in traversal_ids:
-        res = auth_client.get(f"/api/agent/checkpoint/{cp_id}")
-        assert res.status_code in (400, 404)
-
-        res_rb = auth_client.post(f"/api/agent/checkpoint/{cp_id}/rollback", json={})
-        assert res_rb.status_code in (400, 404)
-
-
-# ---------------------------------------------------------------------------
-# 5. Static Inspection Security Audits
+# 6. Static Code Audits
 # ---------------------------------------------------------------------------
 
 

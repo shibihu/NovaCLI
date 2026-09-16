@@ -91,7 +91,7 @@ class CheckpointCreateBody(BaseModel):
 
 class RollbackBody(BaseModel):
     session_id: str | None = None
-    confirm: bool = True
+    confirm: bool = False
 
 
 class MkdirBody(BaseModel):
@@ -618,11 +618,16 @@ async def rollback_checkpoint(
     request: Request, checkpoint_id: str, body: RollbackBody | None = None
 ) -> dict[str, Any]:
     """Safely rollback workspace state to a checkpoint baseline."""
+    if not body or not body.confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Rollback requires explicit confirmation (confirm=True)",
+        )
+
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
-    session_id = body.session_id if body else None
     try:
-        res = cpm.rollback(checkpoint_id, session_id=session_id)
+        res = cpm.rollback(checkpoint_id, session_id=body.session_id)
         return res.to_dict()
     except PermissionError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
