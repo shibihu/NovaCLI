@@ -32,6 +32,7 @@ DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-20b"
 DEFAULT_CEREBRAS_MODEL = "llama3.1-8b"
 
 DEFAULT_TIMEOUT = 30
+DEFAULT_LLM_TIMEOUT = 1800
 DEFAULT_MAX_STEPS = 8
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -39,7 +40,8 @@ DEFAULT_MAX_CONTEXT_CHARS = 14_000
 DEFAULT_APPROVAL_TIMEOUT = 300.0
 
 MIN_TIMEOUT = 1
-MAX_TIMEOUT = 1800
+MAX_COMMAND_TIMEOUT = 1800
+MAX_LLM_TIMEOUT = 86400
 MIN_MAX_STEPS = 1
 MAX_MAX_STEPS = 50
 
@@ -257,6 +259,7 @@ class Settings:
     cerebras_model: str
     project_root: Path
     command_timeout: int
+    llm_timeout: int = DEFAULT_LLM_TIMEOUT
 
     # Additional (non-required) knobs.
     max_steps: int = DEFAULT_MAX_STEPS
@@ -352,6 +355,7 @@ class Settings:
             "cerebras_model": self.cerebras_model,
             "project_root": str(self.project_root),
             "command_timeout": self.command_timeout,
+            "llm_timeout": self.llm_timeout,
             "max_steps": self.max_steps,
             "safety_mode": self.safety_mode,
             "host": self.host,
@@ -471,11 +475,17 @@ def load_settings(
     ollama_base_url = layered("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL
 
     # -- Remaining values --------------------------------------------------
-    timeout = _as_int(
+    command_timeout = _as_int(
         layered("NOVA_COMMAND_TIMEOUT") or DEFAULT_TIMEOUT,
         DEFAULT_TIMEOUT,
         low=MIN_TIMEOUT,
-        high=MAX_TIMEOUT,
+        high=MAX_COMMAND_TIMEOUT,
+    )
+    llm_timeout = _as_int(
+        layered("NOVA_LLM_TIMEOUT") or DEFAULT_LLM_TIMEOUT,
+        DEFAULT_LLM_TIMEOUT,
+        low=MIN_TIMEOUT,
+        high=MAX_LLM_TIMEOUT,
     )
     max_steps = _as_int(
         layered("NOVA_MAX_STEPS") or DEFAULT_MAX_STEPS,
@@ -510,7 +520,8 @@ def load_settings(
         cerebras_api_key=cerebras_key,
         cerebras_model=_as_str(cerebras_model, DEFAULT_CEREBRAS_MODEL),
         project_root=root,
-        command_timeout=timeout,
+        command_timeout=command_timeout,
+        llm_timeout=llm_timeout,
         max_steps=max_steps,
         safety_mode=safety_mode,
         host=layered("NOVA_HOST") or DEFAULT_HOST,

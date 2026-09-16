@@ -284,3 +284,35 @@ def test_load_settings_environment_includes_dotenv_and_environ(tmp_path: Path):
     assert settings.environment.get("DOTENV_ONLY_VAR") == "from_dotenv"
     assert settings.environment.get("OVERRIDDEN_VAR") == "proc_val"
     assert settings.environment.get("PROC_ONLY_VAR") == "proc_val_only"
+
+
+# --- Timeout separation tests -----------------------------------------------
+
+
+def test_timeout_separation_defaults(tmp_path: Path) -> None:
+    settings = load_settings(
+        project_root=tmp_path,
+        user_config_path=tmp_path / "absent.json",
+    )
+    assert settings.command_timeout == 30
+    assert settings.llm_timeout == 1800
+
+
+def test_timeout_separation_custom_env(tmp_path: Path) -> None:
+    settings = load_settings(
+        project_root=tmp_path,
+        env={"NOVA_COMMAND_TIMEOUT": "45", "NOVA_LLM_TIMEOUT": "3600"},
+        user_config_path=tmp_path / "absent.json",
+    )
+    assert settings.command_timeout == 45
+    assert settings.llm_timeout == 3600
+
+
+def test_provider_llm_timeout_independence(tmp_path: Path) -> None:
+    settings = load_settings(
+        project_root=tmp_path,
+        env={"NOVA_LLM_TIMEOUT": "2400"},
+        user_config_path=tmp_path / "absent.json",
+    )
+    assert settings.command_timeout == 30
+    assert settings.llm_timeout == 2400

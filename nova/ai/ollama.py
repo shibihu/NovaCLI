@@ -17,7 +17,7 @@ from . import AIProviderError
 
 DEFAULT_MODEL = "qwen3:4b"
 DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 600
+DEFAULT_TIMEOUT = 1800
 
 
 class OllamaProvider:
