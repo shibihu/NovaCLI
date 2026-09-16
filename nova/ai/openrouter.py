@@ -168,6 +168,14 @@ class OpenRouterProvider:
                     raw_args_str = "{}"
                     parsed_args = {}
 
+                # Extract provider-specific metadata (e.g. Gemini thought_signature via OpenRouter)
+                provider_data: dict[str, Any] = {}
+                for key in ("thought_signature", "extra_content", "thinking"):
+                    if key in tc and tc[key] is not None:
+                        provider_data[key] = tc[key]
+                    elif isinstance(func, dict) and key in func and func[key] is not None:
+                        provider_data[key] = func[key]
+
                 if name:
                     parsed_tool_calls.append(
                         ToolCall(
@@ -175,6 +183,7 @@ class OpenRouterProvider:
                             name=str(name),
                             arguments=parsed_args,
                             raw_arguments=raw_args_str,
+                            provider_data=provider_data,
                         )
                     )
 

@@ -108,6 +108,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any] | None = None
     raw_arguments: str = ""
+    provider_data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return as_dict(self)
