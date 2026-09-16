@@ -303,7 +303,7 @@ async def test_async_context_manager() -> None:
 
 def test_get_provider_passes_settings_through() -> None:
     settings = SimpleNamespace(
-        groq_api_key=SECRET, groq_model="llama-3.1-8b-instant", command_timeout=45
+        groq_api_key=SECRET, groq_model="llama-3.1-8b-instant", llm_timeout=45
     )
     provider = get_provider(settings)
     assert provider.model_name == "llama-3.1-8b-instant"

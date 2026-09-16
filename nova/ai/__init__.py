@@ -100,7 +100,7 @@ def get_provider(settings: object, name: str | None = None) -> AIProvider:
         return GroqProvider(
             api_key=getattr(settings, "groq_api_key", None),
             model=getattr(settings, "groq_model", None) or getattr(settings, "model", "openai/gpt-oss-20b"),
-            timeout=float(getattr(settings, "command_timeout", 30)),
+            timeout=float(getattr(settings, "llm_timeout", 1800)),
             reasoning_effort=getattr(settings, "reasoning_effort", None),
         )
 
@@ -110,7 +110,7 @@ def get_provider(settings: object, name: str | None = None) -> AIProvider:
         return OllamaProvider(
             base_url=getattr(settings, "ollama_base_url", "http://localhost:11434"),
             model=getattr(settings, "ollama_model", None) or getattr(settings, "model", "qwen3:4b"),
-            timeout=float(getattr(settings, "command_timeout", 30)),
+            timeout=float(getattr(settings, "llm_timeout", 1800)),
         )
 
     if prov_name == "gemini":
@@ -119,7 +119,7 @@ def get_provider(settings: object, name: str | None = None) -> AIProvider:
         return GeminiProvider(
             api_key=getattr(settings, "gemini_api_key", None),
             model=getattr(settings, "gemini_model", None) or getattr(settings, "model", "gemini-2.5-flash"),
-            timeout=float(getattr(settings, "command_timeout", 30)),
+            timeout=float(getattr(settings, "llm_timeout", 1800)),
         )
 
     if prov_name == "openrouter":
@@ -128,7 +128,7 @@ def get_provider(settings: object, name: str | None = None) -> AIProvider:
         return OpenRouterProvider(
             api_key=getattr(settings, "openrouter_api_key", None),
             model=getattr(settings, "openrouter_model", None) or getattr(settings, "model", "openai/gpt-oss-20b"),
-            timeout=float(getattr(settings, "command_timeout", 30)),
+            timeout=float(getattr(settings, "llm_timeout", 1800)),
         )
 
     if prov_name == "cerebras":
@@ -137,7 +137,7 @@ def get_provider(settings: object, name: str | None = None) -> AIProvider:
         return CerebrasProvider(
             api_key=getattr(settings, "cerebras_api_key", None),
             model=getattr(settings, "cerebras_model", None) or getattr(settings, "model", "llama3.1-8b"),
-            timeout=float(getattr(settings, "command_timeout", 30)),
+            timeout=float(getattr(settings, "llm_timeout", 1800)),
         )
 
     raise AIProviderError(

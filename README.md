@@ -169,7 +169,8 @@ nova doctor
 | `groq_api_key` | `GROQ_API_KEY` | — | Provider credential |
 | `groq_model` | `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq model id (GPT-OSS 20B recommended) |
 | `project_root` | `NOVA_PROJECT_ROOT` | current directory | Workspace root the agent may touch |
-| `command_timeout` | `NOVA_COMMAND_TIMEOUT` | `30` | Seconds before a command is killed |
+| `command_timeout` | `NOVA_COMMAND_TIMEOUT` | `30` | Seconds before a shell command is killed |
+| `llm_timeout` | `NOVA_LLM_TIMEOUT` | `1800` | Seconds before an LLM API request times out (30 mins for local inference) |
 | `max_steps` | `NOVA_MAX_STEPS` | `8` | Agent reasoning steps per task |
 | `safety_mode` | `NOVA_SAFETY_MODE` | `smart` | `smart` \| `strict` \| `permissive` |
 | `reasoning_effort` | `NOVA_REASONING_EFFORT` | `None` | `low` \| `medium` \| `high` (for GPT-OSS models) |

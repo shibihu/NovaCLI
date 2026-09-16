@@ -122,3 +122,30 @@ async def test_no_silent_failover():
     provider = OllamaProvider(base_url="http://localhost:11434", model="qwen3:8b", client=client)
     with pytest.raises(AIProviderError, match="Cannot connect to Ollama"):
         await provider.complete([{"role": "user", "content": "hello"}])
+
+
+# --- Timeout separation tests -----------------------------------------------
+
+
+def test_get_provider_passes_llm_timeout():
+    s_ollama = SimpleNamespace(
+        provider="ollama",
+        ollama_model="m2",
+        ollama_base_url="http://localhost:11434",
+        command_timeout=30,
+        llm_timeout=1800,
+    )
+    prov = get_provider(s_ollama)
+    assert isinstance(prov, OllamaProvider)
+    assert prov.timeout == 1800.0
+
+
+@pytest.mark.asyncio
+async def test_ollama_timeout_error_message_format():
+    def mock_transport(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("Timeout")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock_transport))
+    provider = OllamaProvider(base_url="http://localhost:11434", model="qwen3:8b", timeout=1800, client=client)
+    with pytest.raises(AIProviderError, match="Ollama request timed out after 1800s"):
+        await provider.complete([{"role": "user", "content": "hello"}])
