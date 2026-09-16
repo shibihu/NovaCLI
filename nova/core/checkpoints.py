@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -128,12 +129,37 @@ class CheckpointManager:
         self._ensure_storage()
 
     def _ensure_storage(self) -> None:
-        """Ensure .nova/checkpoints exists and is ignored by Git."""
-        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        gitignore = self.root / ".nova" / ".gitignore"
+        """Ensure .nova/checkpoints exists and is ignored by Git without symlink redirection."""
+        nova_dir = self.root / ".nova"
+
+        # Reject .nova if it is a symlink, junction, or reparse point
+        if nova_dir.exists() and (nova_dir.is_symlink() or os.path.islink(nova_dir)):
+            raise SafetyError("Storage root .nova is a symlink or reparse point", None)
+
+        if nova_dir.exists():
+            try:
+                if self.root not in nova_dir.resolve().parents and nova_dir.resolve() != self.root:
+                    raise SafetyError("Storage root .nova resolves outside workspace root", None)
+            except OSError as exc:
+                raise SafetyError(f"Cannot resolve .nova: {exc}", None) from exc
+
+        cp_dir = nova_dir / "checkpoints"
+        if cp_dir.exists() and (cp_dir.is_symlink() or os.path.islink(cp_dir)):
+            raise SafetyError("Storage root .nova/checkpoints is a symlink or reparse point", None)
+
+        if cp_dir.exists():
+            try:
+                if self.root not in cp_dir.resolve().parents:
+                    raise SafetyError("Storage root .nova/checkpoints resolves outside workspace root", None)
+            except OSError as exc:
+                raise SafetyError(f"Cannot resolve .nova/checkpoints: {exc}", None) from exc
+
+        nova_dir.mkdir(parents=True, exist_ok=True)
+        cp_dir.mkdir(parents=True, exist_ok=True)
+
+        gitignore = nova_dir / ".gitignore"
         if not gitignore.exists():
             try:
-                gitignore.parent.mkdir(parents=True, exist_ok=True)
                 gitignore.write_text("*\n", encoding="utf-8")
             except OSError:
                 pass
@@ -277,7 +303,7 @@ class CheckpointManager:
         return checkpoint
 
     def get(self, checkpoint_id: str, session_id: str | None = None) -> Checkpoint | None:
-        """Retrieve a checkpoint by ID enforcing session and workspace ownership."""
+        """Retrieve a checkpoint by ID enforcing strict manifest schema and session/workspace ownership."""
         try:
             cp_id = self._validate_id(checkpoint_id)
         except ValueError:
@@ -292,17 +318,34 @@ class CheckpointManager:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return None
-            meta = data.get("metadata", {})
+
+            meta = data.get("metadata")
             if not isinstance(meta, dict):
+                return None
+
+            # Strict top-level fields validation
+            cp_id_meta = meta.get("id")
+            if not isinstance(cp_id_meta, str) or not _VALID_ID_RE.match(cp_id_meta):
+                return None
+
+            task_id_meta = meta.get("task_id")
+            if not isinstance(task_id_meta, str):
+                return None
+
+            created_at_meta = meta.get("created_at")
+            if not isinstance(created_at_meta, str):
+                return None
+
+            cp_root = meta.get("root")
+            if not isinstance(cp_root, str) or (cp_root and Path(cp_root).resolve() != self.root):
+                return None
+
+            status_meta = meta.get("status", "active")
+            if not isinstance(status_meta, str):
                 return None
 
             stored_session = data.get("session_id") or meta.get("session_id")
             if stored_session is not None and not isinstance(stored_session, str):
-                stored_session = str(stored_session)
-
-            # Workspace root verification
-            cp_root = meta.get("root", "")
-            if cp_root and Path(cp_root).resolve() != self.root:
                 return None
 
             # Mandatory Session ownership verification
@@ -312,47 +355,78 @@ class CheckpointManager:
                         f"Session ownership mismatch: checkpoint {checkpoint_id!r} requires session {stored_session!r}"
                     )
 
-            files = []
-            raw_files = meta.get("files", [])
-            if isinstance(raw_files, list):
-                for f in raw_files:
-                    if not isinstance(f, dict):
-                        continue
-                    p = f.get("path")
-                    if p and isinstance(p, str) and _is_safe_rel_path(p):
-                        state = str(f.get("state") or "clean")
-                        b_hash = str(f["before_hash"]) if f.get("before_hash") else None
-                        a_hash = str(f["after_hash"]) if f.get("after_hash") else None
-                        ex_before = bool(f.get("existed_before", True))
-                        ex_after = bool(f.get("existed_after", True))
-                        is_user = bool(f.get("is_user_owned", False))
-                        files.append(
-                            CheckpointFile(
-                                path=p,
-                                state=state,
-                                before_hash=b_hash,
-                                after_hash=a_hash,
-                                existed_before=ex_before,
-                                existed_after=ex_after,
-                                is_user_owned=is_user,
-                            )
-                        )
+            # Strict user_dirty_files validation
+            raw_user_dirty = meta.get("user_dirty_files")
+            if not isinstance(raw_user_dirty, list):
+                return None
+            user_dirty_files: list[str] = []
+            for item in raw_user_dirty:
+                if not isinstance(item, str) or not _is_safe_rel_path(item):
+                    return None
+                user_dirty_files.append(item)
 
-            raw_user_dirty = meta.get("user_dirty_files", [])
-            user_dirty_files = [
-                str(p) for p in raw_user_dirty if isinstance(p, str) and _is_safe_rel_path(p)
-            ] if isinstance(raw_user_dirty, list) else []
+            # Strict files list validation
+            raw_files = meta.get("files")
+            if not isinstance(raw_files, list):
+                return None
+
+            files: list[CheckpointFile] = []
+            valid_states = {"clean", "created", "modified", "deleted"}
+
+            for f in raw_files:
+                if not isinstance(f, dict):
+                    return None
+
+                p = f.get("path")
+                if not isinstance(p, str) or not _is_safe_rel_path(p):
+                    return None
+
+                state = f.get("state")
+                if not isinstance(state, str) or state not in valid_states:
+                    return None
+
+                b_hash = f.get("before_hash")
+                if b_hash is not None and not isinstance(b_hash, str):
+                    return None
+
+                a_hash = f.get("after_hash")
+                if a_hash is not None and not isinstance(a_hash, str):
+                    return None
+
+                ex_before = f.get("existed_before", True)
+                if type(ex_before) is not bool:
+                    return None
+
+                ex_after = f.get("existed_after", True)
+                if type(ex_after) is not bool:
+                    return None
+
+                is_user = f.get("is_user_owned", False)
+                if type(is_user) is not bool:
+                    return None
+
+                files.append(
+                    CheckpointFile(
+                        path=p,
+                        state=state,
+                        before_hash=b_hash,
+                        after_hash=a_hash,
+                        existed_before=ex_before,
+                        existed_after=ex_after,
+                        is_user_owned=is_user,
+                    )
+                )
 
             return Checkpoint(
-                id=str(meta.get("id", cp_id)),
-                task_id=str(meta.get("task_id", "")),
+                id=cp_id_meta,
+                task_id=task_id_meta,
                 session_id=stored_session,
-                created_at=str(meta.get("created_at", "")),
-                root=cp_root or str(self.root),
+                created_at=created_at_meta,
+                root=cp_root,
                 files=files,
                 user_dirty_files=user_dirty_files,
-                git_head=str(meta["git_head"]) if meta.get("git_head") else None,
-                status=str(meta.get("status", "active")),
+                git_head=str(meta["git_head"]) if isinstance(meta.get("git_head"), str) else None,
+                status=status_meta,
             )
         except PermissionError:
             raise
