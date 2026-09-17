@@ -668,8 +668,9 @@ class NovaAgent:
 
             # Native tool calling path
             if ai_response.has_tool_calls:
-                assistant_tool_calls = [
-                    {
+                assistant_tool_calls = []
+                for tc in ai_response.tool_calls:
+                    tc_dict = {
                         "id": tc.id,
                         "type": "function",
                         "function": {
@@ -677,8 +678,14 @@ class NovaAgent:
                             "arguments": tc.raw_arguments if tc.raw_arguments else json.dumps(tc.arguments or {}),
                         },
                     }
-                    for tc in ai_response.tool_calls
-                ]
+                    if tc.provider_data:
+                        for k, v in tc.provider_data.items():
+                            if v is not None:
+                                tc_dict[k] = v
+                                if k == "thought_signature" and isinstance(tc_dict.get("function"), dict):
+                                    tc_dict["function"]["thought_signature"] = v
+                    assistant_tool_calls.append(tc_dict)
+
                 messages.append(Message.assistant(content=ai_response.text or None, tool_calls=assistant_tool_calls))
 
                 for tc in ai_response.tool_calls:
