@@ -676,7 +676,7 @@
       if (diffBtn) {
         const cpId = diffBtn.getAttribute("data-cp");
         try {
-          const res = await apiGET("/api/git/diff");
+          const res = await api("/api/git/diff");
           $("diff-meta").textContent = "Diff for checkpoint " + cpId;
           $("diff-content").textContent = res.diff || "(no diff)";
           $("diff-modal").classList.remove("hidden");
@@ -693,7 +693,7 @@
           return;
         }
         try {
-          const res = await apiPOST("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { confirm: true });
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) });
           let msg = "Rollback complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
           if (res.preserved && res.preserved.length > 0) {
             msg += " (" + res.preserved.length + " files preserved due to user conflicts)";
