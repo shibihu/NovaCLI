@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import httpx
@@ -210,6 +211,53 @@ class OllamaProvider:
                     )
 
         text = str(content).strip() if content is not None else None
+
+        # Fallback XML tool_call parsing if raw_tool_calls was empty
+        if not parsed_tool_calls and text:
+            xml_matches = re.findall(r"<tool_call>\s*({.*?})\s*</tool_call>", text, re.DOTALL)
+            if xml_matches:
+                for idx, blob in enumerate(xml_matches):
+                    try:
+                        call_obj = json.loads(blob.strip())
+                        if isinstance(call_obj, dict):
+                            name = call_obj.get("name") or call_obj.get("function") or ""
+                            raw_args = call_obj.get("arguments") or call_obj.get("args") or {}
+                            if isinstance(raw_args, dict):
+                                raw_args_str = json.dumps(raw_args)
+                                parsed_args = raw_args
+                            elif isinstance(raw_args, str):
+                                raw_args_str = raw_args
+                                try:
+                                    parsed_args = json.loads(raw_args)
+                                    if not isinstance(parsed_args, dict):
+                                        parsed_args = None
+                                except Exception:
+                                    parsed_args = None
+                            else:
+                                raw_args_str = "{}"
+                                parsed_args = {}
+
+                            if name:
+                                parsed_tool_calls.append(
+                                    ToolCall(
+                                        id=f"call_ollama_xml_{idx}",
+                                        name=str(name),
+                                        arguments=parsed_args,
+                                        raw_arguments=raw_args_str,
+                                    )
+                                )
+                    except Exception:
+                        pass
+
+                text = re.sub(r"<tool_call>\s*{.*?}\s*</tool_call>", "", text, flags=re.DOTALL).strip()
+
+        # Remove reasoning tags if present in text
+        if text and "<think>" in text:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+        if not text:
+            text = None
+
         if not text and not parsed_tool_calls:
             raise AIProviderError("Ollama returned an empty completion.")
 
