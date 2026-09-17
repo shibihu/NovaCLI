@@ -19,8 +19,9 @@ from nova.core.models import EventType
 def is_ollama_reachable(base_url: str) -> bool:
     try:
         url = f"{base_url.rstrip('/')}/api/version"
-        resp = httpx.get(url, timeout=2.0)
-        return resp.status_code == 200
+        with httpx.Client(timeout=1.0) as client:
+            resp = client.get(url)
+            return resp.status_code == 200
     except Exception:
         return False
 
