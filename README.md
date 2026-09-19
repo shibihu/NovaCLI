@@ -405,7 +405,7 @@ NovaCLI supports two command execution backends:
    - Applies container safety flags: `--cap-drop=ALL`, `--security-opt=no-new-privileges`, memory/CPU limits (`--memory 512m`, `--cpus 1.5`), `--pids-limit 256`, and isolated `/tmp` tmpfs.
    - Automatically terminates hanging containers on command timeout to prevent orphaned processes.
 
-## Agent Checkpoints, Diff Review & Undo
+## Agent Checkpoints, Diff Review, Undo & Redo
 
 NovaCLI automatically captures recovery checkpoints before/during Agent tasks:
 - **Checkpoints**: Stored under `.nova/checkpoints/` (ignored by Git). Snapshots text files without copying sensitive credentials (`.env`, keys).
@@ -413,8 +413,9 @@ NovaCLI automatically captures recovery checkpoints before/during Agent tasks:
 - **Snapshot Symlink & Storage-Root Hardening**: Checkpoint snapshot creation rejects `.nova` or `.nova/checkpoints` symlink/junction/reparse-point redirects, skips file symlinks, enforces canonical workspace containment before reads, and strictly validates manifest schema and field types.
 - **Session & Workspace Context Enforcement**: Checkpoint operations verify session ID and workspace root context to prevent cross-session or cross-workspace checkpoint tampering.
 - **Centralized Execution**: All Git operations in CheckpointManager use centralized `GitService` and `CommandRunner.run_args()` without direct `subprocess` calls or shell invocation.
-- **Diff Review**: Inspect changed files, added/removed lines, and unified diffs before accepting or undoing changes.
-- **Undo / Rollback**: Safely restores Agent-modified files and removes Agent-created files without destroying user-owned work.
+- **Diff Review**: Inspect changed files, added/removed lines, and unified diffs before accepting, undoing, or redoing changes.
+- **Undo / Rollback**: Safely restores Agent-modified files and removes Agent-created files without destroying user-owned work. Captures a pre-undo snapshot for safe redo execution.
+- **Redo Changes**: Reverses a previous Undo operation and restores the exact state before Undo. If a file was manually modified by the user after Undo, Redo detects the post-undo modification, preserves the user's version, and reports a conflict without destroying data.
 - **Git Workflow**: Structured Git operations (`status`, `diff`, `commit_preview`) executed safely via `CommandRunner.run_args()`.
 
 ### Developer API & Command Execution Security
