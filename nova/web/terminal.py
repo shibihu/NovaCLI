@@ -29,6 +29,7 @@ pseudoconsole).
 from __future__ import annotations
 
 import asyncio
+import time
 import contextlib
 import json
 import logging
@@ -223,16 +224,28 @@ async def terminal_websocket(websocket: WebSocket) -> None:
     cols = max(10, min(cols, 500))
     rows = max(5, min(rows, 200))
 
-    # Create the PTY session. Failures are surfaced to the client instead of
-    # being swallowed, because a terminal that cannot start is unusable.
-    try:
-        server_env = dict(settings.environment) if settings and hasattr(settings, "environment") and settings.environment else None
-        session = pty_manager.create(project_root, cols=cols, rows=rows, env=server_env)
-    except Exception as exc:
-        logger.error("Failed to start PTY terminal session: %s", exc)
-        await _send_error(websocket, f"Failed to start terminal: {exc}")
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        return
+    session_id = websocket.query_params.get("session_id")
+    session = None
+    if session_id:
+        session = pty_manager.get(session_id, project_root=project_root)
+        if session and session.is_alive:
+            session.disconnected_at = None
+            try:
+                session.resize(cols, rows)
+            except Exception as exc:
+                logger.warning("PTY resize on reconnect failed (session %s): %s", session.id, exc)
+
+    if not session or not session.is_alive:
+        try:
+            server_env = dict(settings.environment) if settings and hasattr(settings, "environment") and settings.environment else None
+            session = pty_manager.create(project_root, cols=cols, rows=rows, env=server_env)
+        except Exception as exc:
+            logger.error("Failed to start PTY terminal session: %s", exc)
+            await _send_error(websocket, f"Failed to start terminal: {exc}")
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+
+    await _safe_send_json(websocket, {"type": "connected", "session_id": session.id})
 
     # Pump output and input concurrently. Whichever finishes first ends the
     # session: the shell exiting tears down the socket, and the client
@@ -259,7 +272,10 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        pty_manager.close(session.id)
+        if not session.is_alive:
+            pty_manager.close(session.id)
+        else:
+            session.disconnected_at = time.time()
 
 
 __all__ = ["pty_manager", "router", "verify_ws_auth"]

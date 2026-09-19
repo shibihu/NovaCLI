@@ -43,6 +43,7 @@ class PTYSession(ABC):
         self.shell_path = shell_path
         self.env = dict(env) if env else {}
         self._closed = False
+        self.disconnected_at: float | None = None
 
     @property
     @abstractmethod

@@ -978,6 +978,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cp_redo.add_argument("checkpoint_id", help="Checkpoint ID")
     p_cp_redo.add_argument("--confirm", action="store_true", help="Confirm redo")
     p_cp_redo.set_defaults(func=cmd_checkpoint)
+    p_cp_rename = cp_sub.add_parser("rename", parents=[common], help="Rename a checkpoint.")
+    p_cp_rename.add_argument("checkpoint_id", help="Checkpoint ID")
+    p_cp_rename.add_argument("name", help="New human-readable display name")
+    p_cp_rename.set_defaults(func=cmd_checkpoint)
     p_checkpoint.set_defaults(func=cmd_checkpoint)
 
     p_git_cmd = add("git", "Git workflow commands.")
@@ -1061,6 +1065,20 @@ def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Consol
             return 0 if res.ok else 1
         except Exception as exc:
             console.error(f"Redo error: {exc}")
+            return 1
+
+    if subcommand == "rename":
+        cp_id = getattr(args, "checkpoint_id", "")
+        new_name = getattr(args, "name", "")
+        if not cp_id or not new_name:
+            console.error("Usage: nova checkpoint rename <checkpoint_id> <new_name>")
+            return 1
+        try:
+            cp = cpm.rename(cp_id, new_name)
+            console.ok(f"Renamed checkpoint {cp_id} to '{cp.name}'")
+            return 0
+        except Exception as exc:
+            console.error(f"Rename error: {exc}")
             return 1
 
     return 0

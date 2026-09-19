@@ -22,7 +22,104 @@ __all__ = [
     "get_provider",
     "normalize_provider_name",
     "provider_names",
+    "RateLimitInfo",
+    "parse_rate_limit_info",
 ]
+
+
+import re
+from dataclasses import dataclass
+
+@dataclass
+class RateLimitInfo:
+    is_rate_limit: bool
+    retry_after: int = 0
+    limit_type: str = "RPM"
+    provider: str = ""
+    reason: str = ""
+    is_permanent: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "is_rate_limit": self.is_rate_limit,
+            "retry_after": self.retry_after,
+            "limit_type": self.limit_type,
+            "provider": self.provider,
+            "reason": self.reason,
+            "is_permanent": self.is_permanent,
+        }
+
+
+_PERMANENT_PATTERNS = (
+    "daily quota",
+    "daily limit",
+    "monthly quota",
+    "monthly limit",
+    "quota exceeded",
+    "quota exhausted",
+    "insufficient_quota",
+    "billing",
+    "account disabled",
+    "invalid api key",
+    "401",
+    "unauthorized",
+    "forbidden",
+)
+
+def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitInfo:
+    """Extract structured provider rate limit details from exception or HTTP metadata."""
+    msg = str(exc).lower()
+
+    if any(p in msg for p in _PERMANENT_PATTERNS):
+        if any(p in msg for p in ("quota", "billing", "daily", "monthly")):
+            return RateLimitInfo(
+                is_rate_limit=True,
+                retry_after=0,
+                limit_type="DAILY_QUOTA" if "daily" in msg else "BILLING",
+                provider=provider_name,
+                reason="Quota or billing limit exhausted",
+                is_permanent=True,
+            )
+        return RateLimitInfo(
+            is_rate_limit=False,
+            retry_after=0,
+            limit_type="PERMANENT",
+            provider=provider_name,
+            reason="Authentication or authorization failed",
+            is_permanent=True,
+        )
+
+    is_rl = ("rate limit" in msg or "429" in msg or "too many requests" in msg
+             or "tpm" in msg or "rpm" in msg or "resource_exhausted" in msg)
+    if not is_rl:
+        return RateLimitInfo(is_rate_limit=False, provider=provider_name)
+
+    limit_type = "TPM" if "tpm" in msg or "token" in msg else "RPM"
+
+    retry_after = 0
+    match = re.search(r"(?:retry\s+after|try\s+again\s+in|resets?\s+in|wait)\s+(\d+)\s*s?", msg)
+    if match:
+        try:
+            retry_after = int(match.group(1))
+        except ValueError:
+            retry_after = 0
+
+    if not retry_after:
+        match_sec = re.search(r"(\d+)\s*seconds?", msg)
+        if match_sec:
+            try:
+                retry_after = int(match_sec.group(1))
+            except ValueError:
+                retry_after = 0
+
+    return RateLimitInfo(
+        is_rate_limit=True,
+        retry_after=retry_after,
+        limit_type=limit_type,
+        provider=provider_name,
+        reason=f"Per-minute {limit_type} rate limit reached",
+        is_permanent=False,
+    )
 
 
 class AIProviderError(Exception):

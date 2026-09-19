@@ -1,40 +1,50 @@
-"""Tests for rate-limit recovery logic, cancellation, and mascot status rendering."""
+"""Tests for provider-aware rate-limit recovery logic, cancellation, and mascot status rendering."""
 
 import asyncio
 from pathlib import Path
 import pytest
 
-from nova.ai import AIProviderError
-from nova.core.agent import AgentController, NovaAgent, parse_rate_limit_info
+from nova.ai import AIProviderError, parse_rate_limit_info
+from nova.core.agent import AgentController, NovaAgent
 from nova.core.models import AIResponse, EventType
 from nova.ui.mascot import get_safe_status, render_mascot
 from nova.workspace.files import Workspace
 
 
-def test_parse_rate_limit_info():
-    # Minute rate limit with retry after
-    e1 = AIProviderError("Groq rate limit reached (429). Retry after 45s.")
-    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(e1)
-    assert is_rl is True
-    assert retry_after == 45
-    assert is_perm is False
+def test_parse_rate_limit_info_providers():
+    # Groq 429 with retry after
+    e1 = AIProviderError("Groq rate limit reached (429). Retry after 17s.")
+    rl1 = parse_rate_limit_info(e1, provider_name="groq")
+    assert rl1.is_rate_limit is True
+    assert rl1.retry_after == 17
+    assert rl1.is_permanent is False
+    assert rl1.provider == "groq"
 
-    # Minute rate limit without retry delay
-    e2 = AIProviderError("429 Too Many Requests")
-    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(e2)
-    assert is_rl is True
-    assert retry_after == 0
-    assert is_perm is False
+    # Gemini temporary resource exhausted
+    e2 = AIProviderError("Gemini returned RESOURCE_EXHAUSTED: Rate limit reached. Try again in 25 seconds.")
+    rl2 = parse_rate_limit_info(e2, provider_name="gemini")
+    assert rl2.is_rate_limit is True
+    assert rl2.retry_after == 25
+    assert rl2.is_permanent is False
 
-    # Permanent daily quota exhausted
-    e3 = AIProviderError("429 Daily quota exhausted for model")
-    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(e3)
-    assert is_perm is True
+    # Gemini daily quota limit exhausted (permanent)
+    e3 = AIProviderError("Gemini returned RESOURCE_EXHAUSTED: Daily quota limit exceeded for model gemini-2.5-flash.")
+    rl3 = parse_rate_limit_info(e3, provider_name="gemini")
+    assert rl3.is_rate_limit is True
+    assert rl3.is_permanent is True
+    assert rl3.limit_type == "DAILY_QUOTA"
+
+    # OpenRouter 429
+    e4 = AIProviderError("OpenRouter 429 Too Many Requests: resets in 12s")
+    rl4 = parse_rate_limit_info(e4, provider_name="openrouter")
+    assert rl4.is_rate_limit is True
+    assert rl4.retry_after == 12
+    assert rl4.is_permanent is False
 
     # Permanent auth error
-    e4 = AIProviderError("401 Unauthorized: Invalid API key")
-    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(e4)
-    assert is_perm is True
+    e5 = AIProviderError("401 Unauthorized: Invalid API key")
+    rl5 = parse_rate_limit_info(e5, provider_name="groq")
+    assert rl5.is_permanent is True
 
 
 def test_mascot_rendering_and_status():
@@ -104,7 +114,6 @@ async def test_rate_limit_cancellation_during_wait(tmp_path: Path):
         async for evt in agent.stream("Task", controller=controller):
             events.append(evt)
             if evt.type == EventType.RATE_LIMIT_WAIT:
-                # Cancel immediately upon receiving rate limit wait
                 controller.cancel()
         return events
 

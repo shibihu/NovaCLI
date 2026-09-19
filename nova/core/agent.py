@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from nova.ai import AIProvider, AIProviderError
+from nova.ai import AIProvider, AIProviderError, RateLimitInfo, parse_rate_limit_info, parse_rate_limit_info
 from nova.config import Settings, load_settings
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
@@ -57,41 +57,7 @@ _PERMANENT_QUOTA_PATTERNS = (
     "forbidden",
 )
 
-def parse_rate_limit_info(exc: Exception) -> tuple[bool, int, str, bool]:
-    """Parse an exception for rate limit details.
 
-    Returns:
-        (is_rate_limit, retry_after_seconds, reason, is_permanent)
-    """
-    msg = str(exc).lower()
-
-    if any(p in msg for p in _PERMANENT_QUOTA_PATTERNS):
-        if "quota" in msg or "billing" in msg or "daily" in msg or "monthly" in msg:
-            return True, 0, "quota or billing limit exhausted", True
-        return False, 0, "", True
-
-    is_rl = ("rate limit" in msg or "429" in msg or "too many requests" in msg
-             or "tpm" in msg or "rpm" in msg or "resource_exhausted" in msg)
-    if not is_rl:
-        return False, 0, "", False
-
-    retry_after = 0
-    match = re.search(r"(?:retry\s+after|try\s+again\s+in|resets?\s+in|wait)\s+(\d+)\s*s?", msg)
-    if match:
-        try:
-            retry_after = int(match.group(1))
-        except ValueError:
-            retry_after = 0
-
-    if not retry_after:
-        match_sec = re.search(r"(\d+)\s*seconds?", msg)
-        if match_sec:
-            try:
-                retry_after = int(match_sec.group(1))
-            except ValueError:
-                retry_after = 0
-
-    return True, retry_after, "per-minute rate limit", False
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -660,7 +626,7 @@ class NovaAgent:
         controller = controller or AgentController()
         limit = max_steps or self.max_steps
 
-        checkpoint = self.checkpoint_manager.create(task_id=task[:20])
+        checkpoint = self.checkpoint_manager.create(task_id=task)
         checkpoint_id = checkpoint.id
 
         yield AgentEvent(
@@ -719,20 +685,21 @@ class NovaAgent:
                     )
                     break
                 except AIProviderError as exc:
-                    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(exc)
+                    rl_info = parse_rate_limit_info(exc, provider_name=self.provider.model_name)
                     retry_enabled = getattr(self.settings, "rate_limit_retry", True) if hasattr(self, "settings") else True
 
-                    if is_rl and not is_perm and retry_enabled and retry_count < max_retries:
+                    if rl_info.is_rate_limit and not rl_info.is_permanent and retry_enabled and retry_count < max_retries:
                         retry_count += 1
                         fallback_delay = int(getattr(self.settings, "rate_limit_fallback_seconds", 60)) if hasattr(self, "settings") else 60
-                        delay_seconds = retry_after if retry_after > 0 else fallback_delay
+                        delay_seconds = rl_info.retry_after if rl_info.retry_after > 0 else fallback_delay
 
                         yield AgentEvent(
                             EventType.RATE_LIMIT_WAIT,
                             {
                                 "provider": self.provider.model_name,
                                 "retry_after": delay_seconds,
-                                "reason": reason or "per-minute rate limit",
+                                "limit_type": rl_info.limit_type,
+                                "reason": rl_info.reason or "per-minute rate limit",
                                 "retry_attempt": retry_count,
                             },
                             step=index,

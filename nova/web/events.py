@@ -140,11 +140,17 @@ class SessionRegistry:
     # -- Lifecycle -------------------------------------------------------
 
     def create(
-        self, task: str, *, controller: AgentController | None = None, model: str = ""
+        self,
+        task: str,
+        *,
+        session_id: str | None = None,
+        controller: AgentController | None = None,
+        model: str = "",
     ) -> AgentSession:
         self.prune()
+        sid = session_id or uuid.uuid4().hex[:16]
         session = AgentSession(
-            id=uuid.uuid4().hex[:16],
+            id=sid,
             task=task,
             controller=controller or AgentController(),
             model=model,
@@ -187,7 +193,7 @@ class SessionRegistry:
 
     # -- Running ---------------------------------------------------------
 
-    async def run_session(self, session: AgentSession, factory: AgentFactory) -> None:
+    async def run_session(self, session: AgentSession, factory: AgentFactory, storage_manager: Any = None) -> None:
         """Drive the agent for ``session``, publishing every event.
 
         Runs as a background task so the HTTP request that created the session
@@ -240,15 +246,24 @@ class SessionRegistry:
             if session.status not in AgentStatus.terminal():
                 session.status = AgentStatus.DONE
             session.finished_at = time.time()
+            if storage_manager is not None:
+                try:
+                    p_sess = storage_manager.get(session.id)
+                    if p_sess:
+                        p_sess.status = str(session.status)
+                        p_sess.messages = list(session.events)
+                        storage_manager.save(p_sess)
+                except Exception:
+                    pass
             if agent is not None:
                 try:
                     await agent.provider.aclose()
                 except Exception:  # noqa: BLE001 - cleanup is best effort
                     pass
 
-    def start(self, session: AgentSession, factory: AgentFactory) -> asyncio.Task[Any]:
+    def start(self, session: AgentSession, factory: AgentFactory, storage_manager: Any = None) -> asyncio.Task[Any]:
         """Schedule :meth:`run_session` and remember the task."""
-        task = asyncio.create_task(self.run_session(session, factory))
+        task = asyncio.create_task(self.run_session(session, factory, storage_manager=storage_manager))
         session.run_task = task
         return task
 

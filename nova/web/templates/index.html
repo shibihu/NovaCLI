@@ -43,19 +43,36 @@
   <main id="main">
     <!-- Chat ------------------------------------------------------------ -->
     <section class="view is-active" id="view-chat" role="tabpanel" aria-label="Chat">
-      <div class="messages" id="messages" aria-live="polite">
-        <div class="empty" id="chat-empty">
-          <h2>Ask Nova about this project</h2>
-          <p class="muted">It reads files, searches code, runs commands and reports every step.</p>
-          <div class="suggestions" id="suggestions">
-            <button type="button" class="suggestion">Explain what this project does</button>
-            <button type="button" class="suggestion">Find and fix the most likely bug</button>
-            <button type="button" class="suggestion">Write tests for the core module and run them</button>
+      <div class="chat-layout">
+        <aside class="chat-sidebar is-collapsed" id="chat-sidebar">
+          <div class="sidebar-header">
+            <button type="button" class="btn btn-primary btn-new-chat" id="btn-new-chat">+ New Chat</button>
           </div>
-        </div>
-      </div>
+          <div class="sidebar-title">Recent Chats</div>
+          <ul class="chat-session-list" id="chat-session-list"></ul>
+        </aside>
 
-                <div class="agent-status-card hidden" id="agent-status-card">
+        <div class="chat-main">
+          <div class="chat-header">
+            <button type="button" class="btn btn-ghost sidebar-toggle" id="sidebar-toggle" aria-label="Toggle chats">💬 Chats</button>
+            <span class="active-chat-title" id="active-chat-title">New Chat</span>
+            <button type="button" class="btn btn-ghost btn-rename-chat" id="btn-rename-chat" title="Rename Chat">✏</button>
+            <button type="button" class="btn btn-ghost btn-delete-chat" id="btn-delete-chat" title="Delete Chat">🗑</button>
+          </div>
+
+          <div class="messages" id="messages" aria-live="polite">
+            <div class="empty" id="chat-empty">
+              <h2>Ask Nova about this project</h2>
+              <p class="muted">It reads files, searches code, runs commands and reports every step.</p>
+              <div class="suggestions" id="suggestions">
+                <button type="button" class="suggestion">Explain what this project does</button>
+                <button type="button" class="suggestion">Find and fix the most likely bug</button>
+                <button type="button" class="suggestion">Write tests for the core module and run them</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="agent-status-card hidden" id="agent-status-card">
             <div class="agent-status-header">
               <span class="agent-mascot-icon" id="agent-mascot-icon">✦</span>
               <span class="agent-name">Nova</span>
@@ -64,21 +81,23 @@
           </div>
 
           <div class="progress hidden" id="progress" aria-hidden="true">
-        <div class="progress-bar" id="progress-bar"></div>
-      </div>
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
 
-      <form class="composer" id="composer" autocomplete="off">
-        <label class="sr-only" for="task">Task</label>
-        <textarea
-          id="task"
-          name="task"
-          rows="1"
-          placeholder="Ask Nova to build, fix or explain…"
-          enterkeyhint="send"
-          spellcheck="false"></textarea>
-        <button type="submit" id="send" class="btn btn-primary" aria-label="Send task">Send</button>
-        <button type="button" id="stop" class="btn btn-danger hidden" aria-label="Stop the agent">Stop</button>
-      </form>
+          <form class="composer" id="composer" autocomplete="off">
+            <label class="sr-only" for="task">Task</label>
+            <textarea
+              id="task"
+              name="task"
+              rows="1"
+              placeholder="Ask Nova to build, fix or explain…"
+              enterkeyhint="send"
+              spellcheck="false"></textarea>
+            <button type="submit" id="send" class="btn btn-primary" aria-label="Send task">Send</button>
+            <button type="button" id="stop" class="btn btn-danger hidden" aria-label="Stop the agent">Stop</button>
+          </form>
+        </div>
+      </div>
     </section>
 
     <!-- Files ----------------------------------------------------------- -->

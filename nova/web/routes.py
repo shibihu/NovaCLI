@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from nova.ai import AIProviderError, get_provider
 from nova.config import get_api_key_hint, NovaConfigStore, Settings
 from nova.core.agent import AgentController, build_agent
+from nova.core.sessions import SessionStorageManager
 from nova.core.checkpoints import CheckpointManager
 from nova.core.git import GitService
 from nova.core.models import ApprovalDecision, RiskLevel
@@ -35,10 +36,21 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 
+class SessionCreateBody(BaseModel):
+    task: str | None = Field(default=None, max_length=20_000)
+    title: str | None = Field(default=None, max_length=200)
+    session_id: str | None = Field(default=None, max_length=64)
+
+
+class SessionRenameBody(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
 class AgentRequest(BaseModel):
     """Body of ``POST /api/agent``."""
 
     task: str = Field(min_length=1, max_length=20_000)
+    session_id: str | None = Field(default=None, max_length=64)
     auto_approve: bool = False
 
 
@@ -128,6 +140,12 @@ def _safety(settings: Settings) -> SafetyPolicy:
         settings.safety_mode,
         secret_values=settings.active_secrets,
     )
+
+
+def _session_manager(request: Request) -> SessionStorageManager:
+    settings = _settings(request)
+    workspace = _workspace(settings)
+    return SessionStorageManager(workspace)
 
 
 def _workspace(settings: Settings) -> Workspace:
@@ -371,15 +389,22 @@ async def start_agent(request: Request, body: AgentRequest) -> JSONResponse:
     """Create a session and start the agent in the background."""
     settings = _settings(request)
     registry = _registry(request)
+    mgr = _session_manager(request)
 
     if not settings.has_api_key:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, get_api_key_hint(settings.provider))
 
+    p_sess = None
+    if body.session_id:
+        p_sess = mgr.get(body.session_id)
+    if not p_sess:
+        p_sess = mgr.create(task=body.task, session_id=body.session_id, model=settings.model)
+
     controller = AgentController(
         auto_approve=body.auto_approve, approval_timeout=settings.approval_timeout
     )
-    session = registry.create(body.task, controller=controller, model=settings.model)
-    registry.start(session, _agent_factory(settings))
+    session = registry.create(body.task, session_id=p_sess.id, controller=controller, model=settings.model)
+    registry.start(session, _agent_factory(settings), storage_manager=mgr)
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -423,11 +448,85 @@ async def agent_result(
     return session.to_dict(include_events=events)
 
 
+@router.post("/api/agent/sessions")
+async def create_chat_session(request: Request, body: SessionCreateBody | None = None) -> dict[str, Any]:
+    """Create a persistent chat session."""
+    settings = _settings(request)
+    mgr = _session_manager(request)
+    task = body.task if body and body.task else "New Chat"
+    title = body.title if body and body.title else None
+    session_id = body.session_id if body else None
+
+    sess = mgr.create(task=task, session_id=session_id, title=title, model=settings.model)
+    return {"ok": True, "session": sess.to_dict()}
+
+
 @router.get("/api/agent/sessions")
-async def agent_sessions(request: Request) -> dict[str, Any]:
-    """List sessions, newest first."""
+async def list_chat_sessions(request: Request) -> dict[str, Any]:
+    """List persistent chat sessions metadata for this workspace, newest first."""
+    mgr = _session_manager(request)
     registry = _registry(request)
-    return {"sessions": [session.to_dict() for session in registry.list()]}
+
+    persistent_sessions = {}
+    for s in mgr.list():
+        persistent_sessions[s.id] = {
+            "id": s.id,
+            "title": s.title,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "status": s.status,
+            "model": s.model,
+        }
+
+    for mem_s in registry.list():
+        if mem_s.id in persistent_sessions:
+            persistent_sessions[mem_s.id]["status"] = str(mem_s.status)
+
+    sessions = list(persistent_sessions.values())
+    sessions.sort(key=lambda s: s.get("updated_at") or s.get("created_at") or "", reverse=True)
+    return {"sessions": sessions}
+
+
+@router.get("/api/agent/sessions/{session_id}")
+async def get_chat_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Load persistent chat session metadata and history."""
+    mgr = _session_manager(request)
+    sess = mgr.get(session_id)
+    if not sess:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session {session_id!r} not found or inaccessible")
+
+    registry = _registry(request)
+    mem_sess = registry.get(session_id)
+    session_data = sess.to_dict()
+    if mem_sess:
+        session_data["status"] = str(mem_sess.status)
+        session_data["events"] = mem_sess.snapshot()
+
+    return {"session": session_data}
+
+
+@router.patch("/api/agent/sessions/{session_id}")
+async def rename_chat_session(request: Request, session_id: str, body: SessionRenameBody) -> dict[str, Any]:
+    """Rename a persistent chat session."""
+    mgr = _session_manager(request)
+    try:
+        sess = mgr.rename(session_id, body.title)
+        return {"ok": True, "session": sess.to_dict()}
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.delete("/api/agent/sessions/{session_id}")
+async def delete_chat_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Delete a persistent chat session."""
+    mgr = _session_manager(request)
+    deleted = mgr.delete(session_id)
+    if not deleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session {session_id!r} not found")
+    return {"ok": True, "session_id": session_id}
+
 
 
 @router.post("/api/agent/approve")
