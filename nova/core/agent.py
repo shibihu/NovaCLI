@@ -41,6 +41,58 @@ from .models import (
 from .runner import CommandRunner
 from .safety import SafetyError, SafetyPolicy, SafetyVerdict
 
+_PERMANENT_QUOTA_PATTERNS = (
+    "daily quota",
+    "daily limit",
+    "monthly quota",
+    "monthly limit",
+    "quota exceeded",
+    "quota exhausted",
+    "insufficient_quota",
+    "billing",
+    "account disabled",
+    "invalid api key",
+    "401",
+    "unauthorized",
+    "forbidden",
+)
+
+def parse_rate_limit_info(exc: Exception) -> tuple[bool, int, str, bool]:
+    """Parse an exception for rate limit details.
+
+    Returns:
+        (is_rate_limit, retry_after_seconds, reason, is_permanent)
+    """
+    msg = str(exc).lower()
+
+    if any(p in msg for p in _PERMANENT_QUOTA_PATTERNS):
+        if "quota" in msg or "billing" in msg or "daily" in msg or "monthly" in msg:
+            return True, 0, "quota or billing limit exhausted", True
+        return False, 0, "", True
+
+    is_rl = ("rate limit" in msg or "429" in msg or "too many requests" in msg
+             or "tpm" in msg or "rpm" in msg or "resource_exhausted" in msg)
+    if not is_rl:
+        return False, 0, "", False
+
+    retry_after = 0
+    match = re.search(r"(?:retry\s+after|try\s+again\s+in|resets?\s+in|wait)\s+(\d+)\s*s?", msg)
+    if match:
+        try:
+            retry_after = int(match.group(1))
+        except ValueError:
+            retry_after = 0
+
+    if not retry_after:
+        match_sec = re.search(r"(\d+)\s*seconds?", msg)
+        if match_sec:
+            try:
+                retry_after = int(match_sec.group(1))
+            except ValueError:
+                retry_after = 0
+
+    return True, retry_after, "per-minute rate limit", False
+
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
@@ -620,6 +672,7 @@ class NovaAgent:
                 "max_steps": limit,
                 "safety_mode": str(self.safety.mode),
                 "checkpoint_id": checkpoint_id,
+                        "checkpoint_name": checkpoint.name if checkpoint else checkpoint_id,
             },
         )
 
@@ -653,18 +706,56 @@ class NovaAgent:
                 step=index,
             )
 
-            try:
-                ai_response = await self.provider.complete(
-                    [m.to_dict() for m in messages],
-                    tools=tools_schema,
-                    tool_choice="auto",
-                )
-            except AIProviderError as exc:
-                yield AgentEvent(EventType.ERROR, {"message": str(exc)}, step=index)
-                return
-            except asyncio.CancelledError:
-                yield AgentEvent(EventType.CANCELLED, {"steps": len(steps)}, step=index)
-                return
+            retry_count = 0
+            max_retries = 3
+            ai_response = None
+
+            while True:
+                try:
+                    ai_response = await self.provider.complete(
+                        [m.to_dict() for m in messages],
+                        tools=tools_schema,
+                        tool_choice="auto",
+                    )
+                    break
+                except AIProviderError as exc:
+                    is_rl, retry_after, reason, is_perm = parse_rate_limit_info(exc)
+                    retry_enabled = getattr(self.settings, "rate_limit_retry", True) if hasattr(self, "settings") else True
+
+                    if is_rl and not is_perm and retry_enabled and retry_count < max_retries:
+                        retry_count += 1
+                        fallback_delay = int(getattr(self.settings, "rate_limit_fallback_seconds", 60)) if hasattr(self, "settings") else 60
+                        delay_seconds = retry_after if retry_after > 0 else fallback_delay
+
+                        yield AgentEvent(
+                            EventType.RATE_LIMIT_WAIT,
+                            {
+                                "provider": self.provider.model_name,
+                                "retry_after": delay_seconds,
+                                "reason": reason or "per-minute rate limit",
+                                "retry_attempt": retry_count,
+                            },
+                            step=index,
+                        )
+
+                        cancelled = False
+                        for _ in range(delay_seconds):
+                            if controller.cancelled:
+                                cancelled = True
+                                break
+                            await asyncio.sleep(1.0)
+
+                        if cancelled or controller.cancelled:
+                            yield AgentEvent(EventType.CANCELLED, {"steps": len(steps)}, step=index)
+                            return
+
+                        continue
+
+                    yield AgentEvent(EventType.ERROR, {"message": str(exc)}, step=index)
+                    return
+                except asyncio.CancelledError:
+                    yield AgentEvent(EventType.CANCELLED, {"steps": len(steps)}, step=index)
+                    return
 
             # Native tool calling path
             if ai_response.has_tool_calls:
@@ -820,6 +911,7 @@ class NovaAgent:
                         "steps": len(steps),
                         "files": files,
                         "checkpoint_id": checkpoint_id,
+                        "checkpoint_name": checkpoint.name if checkpoint else checkpoint_id,
                         "changed_files": changed_files,
                     },
                     step=index,
@@ -885,6 +977,7 @@ class NovaAgent:
                 "limit_reached": True,
                 "files": files,
                 "checkpoint_id": checkpoint_id,
+                        "checkpoint_name": checkpoint.name if checkpoint else checkpoint_id,
                 "changed_files": changed_files,
             },
             step=limit,
@@ -1006,6 +1099,7 @@ def build_agent(
 
 __all__ = [
     "AgentController",
+    "parse_rate_limit_info",
     "AgentDecision",
     "NovaAgent",
     "SYSTEM_PROMPT",

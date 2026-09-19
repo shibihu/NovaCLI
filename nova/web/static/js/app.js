@@ -122,10 +122,52 @@
     setStatus(busy ? "busy" : "ok", busy ? "working" : "ready");
   }
 
+
+  function updateAgentStatusCard(state, message) {
+    const card = $("agent-status-card");
+    const mascot = $("agent-mascot-icon");
+    const msgEl = $("agent-status-msg");
+    if (!card || !msgEl) return;
+
+    if (state === "idle" || state === "done") {
+      card.classList.add("hidden");
+      return;
+    }
+
+    card.classList.remove("hidden");
+    const icons = {
+      thinking: "✦",
+      working: "⚙",
+      success: "✓",
+      error: "!",
+      waiting: "⏳",
+    };
+    if (mascot) mascot.textContent = icons[state] || "✦";
+    msgEl.textContent = message;
+  }
+
+  function getToolStatusMsg(tool, input) {
+    if (!tool) return "Nova is working…";
+    if (tool === "project_summary") return "Nova is inspecting project summary…";
+    if (tool === "read_file") {
+      const p = input && input.path ? input.path : "";
+      return p ? "Nova is reading " + esc(p) + "…" : "Nova is reading file…";
+    }
+    if (tool === "write_file") {
+      const p = input && input.path ? input.path : "";
+      return p ? "Nova is editing " + esc(p) + "…" : "Nova is editing files…";
+    }
+    if (tool === "search") return "Nova is searching codebase…";
+    if (tool === "list_files") return "Nova is listing directory…";
+    if (tool === "run_command") return "Nova is running command…";
+    return "Nova is calling " + esc(tool) + "…";
+  }
+
   function handleEvent(event) {
     const data = event.data || {};
     switch (event.type) {
       case "agent_start":
+        updateAgentStatusCard("thinking", "Nova is inspecting the project…");
         addMessage(
           '<div class="msg-head"><span>Nova</span><span class="badge">' +
             esc(data.model || "") +
@@ -139,6 +181,7 @@
         break;
 
       case "step_start":
+        updateAgentStatusCard("working", "Nova is planning the changes…");
         setProgress(Math.min(95, (event.step / (data.of || 8)) * 100));
         break;
 
@@ -147,6 +190,7 @@
         break;
 
       case "tool_call":
+        updateAgentStatusCard("working", getToolStatusMsg(data.tool, data.input));
         addMessage(
           '<div class="msg-head"><span>🔧 tool</span><span class="badge">' +
             esc(data.tool) +
@@ -154,6 +198,14 @@
             esc(truncate(JSON.stringify(data.input || {}), 260)) +
             "</p>",
           "step"
+        );
+        break;
+
+            case "rate_limit_wait":
+        updateAgentStatusCard("waiting", "Nova is waiting for API rate limit (" + (data.retry_after || 60) + "s)…");
+        addMessage(
+          '<div class="msg-head"><span>⏳ rate limit</span></div><p>Rate limit reached — retrying in ' + (data.retry_after || 60) + 's…</p>',
+          "thought"
         );
         break;
 
@@ -207,12 +259,14 @@
         break;
 
       case "final":
+        updateAgentStatusCard("idle", "");
         $("approval-modal").classList.add("hidden");
         let finalHtml = renderMarkdown(data.answer || "(no answer)");
         if (data.checkpoint_id) {
           const changed = data.changed_files || [];
+          const cpName = data.checkpoint_name || data.checkpoint_id;
           finalHtml += '<div class="checkpoint-box" style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">' +
-                       '<div><strong>Checkpoint:</strong> <code>' + esc(data.checkpoint_id) + '</code> <span class="muted">(' + changed.length + ' changed files)</span></div>' +
+                       '<div><strong>Checkpoint:</strong> <span style="font-weight: 600;">' + esc(cpName) + '</span> <code class="muted">(' + esc(data.checkpoint_id) + ')</code> <span class="muted">(' + changed.length + ' changed files)</span></div>' +
                        '<div style="margin-top: 8px; display: flex; gap: 8px;">' +
                        '<button type="button" class="btn btn-ghost btn-view-diff" data-cp="' + esc(data.checkpoint_id) + '">View Diff</button>' +
                        '<button type="button" class="btn btn-danger btn-undo-cp" data-cp="' + esc(data.checkpoint_id) + '">Undo Changes</button>' +
@@ -225,6 +279,7 @@
         break;
 
       case "error":
+        updateAgentStatusCard("idle", "");
         $("approval-modal").classList.add("hidden");
         addMessage(
           '<div class="msg-head"><span>error</span></div><p>' + esc(data.message || "unknown error") + "</p>",
@@ -234,6 +289,7 @@
         break;
 
       case "cancelled":
+        updateAgentStatusCard("idle", "");
         $("approval-modal").classList.add("hidden");
         addMessage("<p>Cancelled.</p>", "thought");
         setBusy(false);

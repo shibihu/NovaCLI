@@ -84,6 +84,10 @@ class TestRunBody(BaseModel):
     approve: bool = False
 
 
+class CheckpointRenameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
 class CheckpointCreateBody(BaseModel):
     task_id: str = Field(min_length=1, max_length=100)
     session_id: str | None = None
@@ -664,6 +668,27 @@ async def redo_checkpoint(
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except (ValueError, SafetyError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.patch("/api/agent/checkpoint/{checkpoint_id}")
+async def rename_checkpoint(
+    request: Request,
+    checkpoint_id: str,
+    body: CheckpointRenameBody,
+    session_id: str | None = Query(None, max_length=64),
+) -> dict[str, Any]:
+    """Rename a checkpoint's human-readable display name."""
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    try:
+        cp = cpm.rename(checkpoint_id, body.name, session_id=session_id)
+        return {"ok": True, "checkpoint": cp.to_dict()}
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 

@@ -603,3 +603,39 @@ details.tool-out summary {
   color: #ffffff;
   border-color: var(--accent, #58a6ff);
 }
+
+/* --- Agent Status Card & Mascot ----------------------------------------- */
+
+.agent-status-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  margin-bottom: 6px;
+  animation: rise 160ms ease-out;
+}
+
+.agent-status-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
+.agent-mascot-icon {
+  font-size: 16px;
+}
+
+.agent-status-msg {
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

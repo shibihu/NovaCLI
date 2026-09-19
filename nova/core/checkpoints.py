@@ -56,6 +56,32 @@ def _file_hash(content: str | bytes) -> str:
     return hashlib.sha256(content).hexdigest()[:16]
 
 
+def generate_checkpoint_name(task_id: str) -> str:
+    """Generate a clean, human-readable display name for a checkpoint based on task."""
+    if not task_id or not isinstance(task_id, str):
+        return "Agent Checkpoint"
+
+    clean = task_id.strip().splitlines()[0].strip()
+    clean = re.sub(r"^[#\-\*%s]+", "", clean)
+    clean = re.sub(r"[`\*_]", "", clean)
+    clean = clean.strip(".,;:?!'\"-")
+
+    if not clean:
+        return "Agent Checkpoint"
+
+    if len(clean) > 50:
+        words = clean[:50].rsplit(" ", 1)[0]
+        clean = words if words else clean[:50]
+
+    clean = re.sub(r"[\r\n\t\x00-\x1f]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    if not clean:
+        return "Agent Checkpoint"
+
+    return clean[0].upper() + clean[1:] if len(clean) > 1 else clean.upper()
+
+
 def is_sensitive_path(path_str: str) -> bool:
     """True if path matches credential material or sensitive files."""
     name = Path(path_str).name
@@ -86,13 +112,17 @@ class CheckpointFile:
     is_user_owned: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(asdict(self))
+        d = to_jsonable(asdict(self))
+        if not d.get("name"):
+            d["name"] = generate_checkpoint_name(getattr(self, "task_id", None) or getattr(self, "checkpoint_id", None) or getattr(self, "id", ""))
+        return d
 
 
 @dataclass
 class Checkpoint:
     id: str
     task_id: str
+    name: str = ""
     session_id: str | None = None
     created_at: str = field(default_factory=utc_now_iso)
     root: str = ""
@@ -102,7 +132,10 @@ class Checkpoint:
     status: str = "active"
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(asdict(self))
+        d = to_jsonable(asdict(self))
+        if not d.get("name"):
+            d["name"] = generate_checkpoint_name(getattr(self, "task_id", None) or getattr(self, "checkpoint_id", None) or getattr(self, "id", ""))
+        return d
 
 
 
@@ -116,7 +149,10 @@ class RedoResult:
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(asdict(self))
+        d = to_jsonable(asdict(self))
+        if not d.get("name"):
+            d["name"] = generate_checkpoint_name(getattr(self, "task_id", None) or getattr(self, "checkpoint_id", None) or getattr(self, "id", ""))
+        return d
 
 @dataclass
 class RollbackResult:
@@ -128,7 +164,10 @@ class RollbackResult:
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return to_jsonable(asdict(self))
+        d = to_jsonable(asdict(self))
+        if not d.get("name"):
+            d["name"] = generate_checkpoint_name(getattr(self, "task_id", None) or getattr(self, "checkpoint_id", None) or getattr(self, "id", ""))
+        return d
 
 
 class CheckpointManager:
@@ -226,7 +265,7 @@ class CheckpointManager:
                 return None
         return None
 
-    def create(self, task_id: str, session_id: str | None = None) -> Checkpoint:
+    def create(self, task_id: str, session_id: str | None = None, name: str | None = None) -> Checkpoint:
         """Create a new checkpoint before/during Agent task execution."""
         clean_task = re.sub(r"[^a-zA-Z0-9_\-]", "", task_id)[:8] or "task"
         cp_id = f"cp_{int(time.time() * 1000)}_{clean_task}"
@@ -295,9 +334,11 @@ class CheckpointManager:
             except (OSError, ValueError):
                 continue
 
+        cp_name = name if name else generate_checkpoint_name(task_id)
         checkpoint = Checkpoint(
             id=cp_id,
             task_id=task_id,
+            name=cp_name,
             session_id=session_id,
             created_at=utc_now_iso(),
             root=str(self.root),
@@ -430,9 +471,14 @@ class CheckpointManager:
                     )
                 )
 
+            cp_name_meta = meta.get("name")
+            if not isinstance(cp_name_meta, str) or not cp_name_meta.strip():
+                cp_name_meta = generate_checkpoint_name(task_id_meta or cp_id_meta)
+
             return Checkpoint(
                 id=cp_id_meta,
                 task_id=task_id_meta,
+                name=cp_name_meta,
                 session_id=stored_session,
                 created_at=created_at_meta,
                 root=cp_root,
@@ -844,6 +890,37 @@ class CheckpointManager:
             errors=errors,
         )
 
+    def rename(self, checkpoint_id: str, new_name: str, session_id: str | None = None) -> Checkpoint:
+        """Rename a checkpoint's human-readable name with strict input validation."""
+        cp = self.get(checkpoint_id, session_id=session_id)
+        if cp is None:
+            raise KeyError(f"Checkpoint {checkpoint_id!r} not found or inaccessible")
+
+        clean_name = (new_name or "").strip()
+        if not clean_name:
+            raise ValueError("Checkpoint name cannot be empty")
+        if len(clean_name) > 100:
+            clean_name = clean_name[:100]
+
+        if any(c in clean_name for c in ("\r", "\n", "\t", "\x00", "/", "\\")):
+            raise ValueError("Checkpoint name contains invalid characters")
+        if ".." in clean_name:
+            raise ValueError("Checkpoint name cannot contain path traversal")
+
+        cp.name = clean_name
+
+        cp_dir = self.checkpoints_dir / cp.id
+        manifest_path = cp_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                mdata = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mdata["metadata"]["name"] = clean_name
+                manifest_path.write_text(json.dumps(mdata, indent=2), encoding="utf-8")
+            except Exception as exc:
+                raise ValueError(f"Failed to update manifest: {exc}") from exc
+
+        return cp
+
     def delete(self, checkpoint_id: str, session_id: str | None = None) -> bool:
         """Delete a checkpoint record and its snapshots."""
         try:
@@ -877,5 +954,6 @@ __all__ = [
     "CheckpointManager",
     "RedoResult",
     "RollbackResult",
+    "generate_checkpoint_name",
     "is_sensitive_path",
 ]

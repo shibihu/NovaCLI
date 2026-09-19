@@ -49,6 +49,7 @@ from nova.workspace.projects import ProjectAnalyzer
 from nova.core.checkpoints import CheckpointManager
 from nova.core.git import GitService
 from nova.intelligence.cache import IntelligenceCache
+from nova.ui.mascot import render_mascot, get_safe_status
 
 # ---------------------------------------------------------------------------
 # Terminal styling
@@ -183,8 +184,9 @@ def _print_event(console: Console, event: Any, *, verbose: bool) -> None:
 
     if kind == EventType.AGENT_START:
         console.write()
+        mascot_sym = render_mascot("working", use_unicode=console.color)
         console.write(
-            console.paint(f"◆ Nova · {data.get('model')} · {data.get('safety_mode')} mode", "magenta")
+            console.paint(f"◆ {mascot_sym} · {data.get('model')} · {data.get('safety_mode')} mode", "magenta")
         )
         console.write(console.paint(f"  workspace {data.get('project')}", "dim"))
     elif kind == EventType.THOUGHT:
@@ -212,13 +214,20 @@ def _print_event(console: Console, event: Any, *, verbose: bool) -> None:
         console.write(f"    {console.paint('→', style)} {console.paint(decision, style)}")
     elif kind == EventType.FINAL:
         console.write()
-        console.rule("answer")
+        mascot_sym = render_mascot("success", use_unicode=console.color)
+        console.rule(f"{mascot_sym} answer")
         console.write(str(data.get("answer", "")).strip())
         console.write()
         console.write(console.paint(f"  ({data.get('steps', 0)} steps)", "dim"))
     elif kind == EventType.ERROR:
         console.write()
         console.error(str(data.get("message", "unknown error")))
+    elif kind == EventType.RATE_LIMIT_WAIT:
+        delay = data.get("retry_after", 60)
+        provider = data.get("provider", "provider")
+        console.write(
+            f"  {console.paint('⏳', 'yellow')} {console.paint(f'Rate limit reached on {provider} — retrying in {delay}s…', 'yellow')}"
+        )
     elif kind == EventType.CANCELLED:
         console.write()
         console.warn("Cancelled.")
@@ -996,7 +1005,7 @@ def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Consol
             return 0
         console.header("Agent Checkpoints")
         for cp in cps:
-            console.write(f"- {cp.id} | task: {cp.task_id} | created: {cp.created_at}")
+            console.write(f"- {cp.name} (ID: {cp.id}) | task: {cp.task_id} | created: {cp.created_at}")
         return 0
 
     if subcommand in ("show", "inspect"):
@@ -1006,7 +1015,10 @@ def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Consol
             return 1
         try:
             info = cpm.inspect(cp_id)
-            console.header(f"Checkpoint {cp_id}")
+            cp_obj = cpm.get(cp_id)
+            cp_name = cp_obj.name if cp_obj else cp_id
+            console.header(f"Checkpoint: {cp_name}")
+            console.write(f"ID:      {cp_id}")
             console.write(f"Task ID: {info['task_id']}")
             console.write(f"Created: {info['created_at']}")
             console.write(f"Changed files ({info['total_changes']}):")
