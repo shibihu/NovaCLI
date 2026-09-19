@@ -105,6 +105,19 @@ class Checkpoint:
         return to_jsonable(asdict(self))
 
 
+
+@dataclass
+class RedoResult:
+    ok: bool
+    checkpoint_id: str
+    restored: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    preserved: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_jsonable(asdict(self))
+
 @dataclass
 class RollbackResult:
     ok: bool
@@ -525,6 +538,7 @@ class CheckpointManager:
         """Safely restore workspace state to checkpoint baseline.
 
         NEVER overwrites or deletes pre-existing user-owned files.
+        Captures pre-undo state so Redo can restore agent changes.
         """
         cp_id = self._validate_id(checkpoint_id)
         cp = self.get(cp_id, session_id=session_id)
@@ -540,6 +554,16 @@ class CheckpointManager:
 
         inspection = self.inspect(cp_id, session_id=session_id)
         changed_files = inspection["changed_files"]
+
+        # Prepare Redo snapshot directory
+        redo_dir = cp_dir / "redo"
+        redo_snapshots = redo_dir / "snapshots"
+        if redo_dir.exists():
+            shutil.rmtree(redo_dir, ignore_errors=True)
+        redo_snapshots.mkdir(parents=True, exist_ok=True)
+        redo_snapshots_resolved = redo_snapshots.resolve()
+
+        redo_file_manifests: list[dict[str, Any]] = []
 
         restored: list[str] = []
         removed: list[str] = []
@@ -567,6 +591,36 @@ class CheckpointManager:
                 preserved.append(f"{rel_path} (preserved_due_to_ownership_conflict)")
                 continue
 
+            # Capture state BEFORE rollback for Redo
+            existed_before_rollback = target.exists() and not target.is_symlink() and target.is_file()
+            hash_before_rollback = None
+            if existed_before_rollback:
+                try:
+                    content_before = target.read_bytes()
+                    hash_before_rollback = _file_hash(content_before)
+                    redo_snap_target = (redo_snapshots / rel_path).resolve()
+                    if redo_snapshots_resolved in redo_snap_target.parents and len(content_before) <= 1_000_000:
+                        redo_snap_target.parent.mkdir(parents=True, exist_ok=True)
+                        redo_snap_target.write_bytes(content_before)
+                except OSError:
+                    pass
+
+            # Calculate expected state AFTER rollback
+            expected_after_undo_hash = None
+            existed_after_undo = False
+            if status in ("modified", "deleted"):
+                try:
+                    snap_file = (snapshots_dir / rel_path).resolve()
+                    if snapshots_dir in snap_file.parents and snap_file.exists() and snap_file.is_file():
+                        existed_after_undo = True
+                        expected_after_undo_hash = _file_hash(snap_file.read_bytes())
+                except Exception:
+                    pass
+            elif status == "created":
+                existed_after_undo = False
+                expected_after_undo_hash = None
+
+            # Execute Rollback
             if status == "created":
                 if target.exists() or target.is_symlink():
                     try:
@@ -578,6 +632,7 @@ class CheckpointManager:
                     except OSError as exc:
                         errors.append(f"Failed to remove {rel_path}: {exc}")
                         preserved.append(rel_path)
+                        continue
 
             elif status in ("modified", "deleted"):
                 try:
@@ -604,11 +659,183 @@ class CheckpointManager:
                     except OSError as exc:
                         errors.append(f"Failed to restore {rel_path}: {exc}")
                         preserved.append(rel_path)
+                        continue
                 else:
                     errors.append(f"Snapshot missing for {rel_path}")
                     preserved.append(rel_path)
+                    continue
+
+            redo_file_manifests.append({
+                "path": rel_path,
+                "status": status,
+                "existed_pre_undo": existed_before_rollback,
+                "pre_undo_hash": hash_before_rollback,
+                "existed_post_undo": existed_after_undo,
+                "expected_post_undo_hash": expected_after_undo_hash,
+            })
+
+        # Save Redo manifest and update checkpoint status
+        redo_manifest_data = {
+            "checkpoint_id": cp.id,
+            "session_id": cp.session_id,
+            "created_at": utc_now_iso(),
+            "files": redo_file_manifests,
+        }
+        (redo_dir / "manifest.json").write_text(json.dumps(redo_manifest_data, indent=2), encoding="utf-8")
+
+        # Update checkpoint status in manifest
+        manifest_path = cp_dir / "manifest.json"
+        try:
+            mdata = json.loads(manifest_path.read_text(encoding="utf-8"))
+            mdata["metadata"]["status"] = "undone"
+            manifest_path.write_text(json.dumps(mdata, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
         return RollbackResult(
+            ok=len(errors) == 0,
+            checkpoint_id=cp_id,
+            restored=restored,
+            removed=removed,
+            preserved=preserved,
+            errors=errors,
+        )
+
+    def redo(self, checkpoint_id: str, *, session_id: str | None = None) -> RedoResult:
+        """Redo a previously undone checkpoint safely.
+
+        Restores agent modifications that existed immediately before Undo.
+        If a file was modified by the user after Undo, it is preserved as a conflict.
+        """
+        cp_id = self._validate_id(checkpoint_id)
+        cp = self.get(cp_id, session_id=session_id)
+        if cp is None:
+            raise KeyError(f"Checkpoint {cp_id!r} not found or inaccessible")
+
+        cp_dir = (self.checkpoints_dir / cp_id).resolve()
+        redo_dir = (cp_dir / "redo").resolve()
+        redo_snapshots = (redo_dir / "snapshots").resolve()
+
+        if self.checkpoints_dir not in cp_dir.parents and cp_dir != self.checkpoints_dir:
+            raise SafetyError("Checkpoint directory is outside storage root", None)
+
+        redo_manifest_path = redo_dir / "manifest.json"
+        if not redo_manifest_path.exists():
+            raise KeyError(f"No redo state available for checkpoint {cp_id!r}")
+
+        try:
+            redo_data = json.loads(redo_manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(redo_data, dict):
+                raise ValueError("Invalid redo manifest")
+
+            stored_session = redo_data.get("session_id")
+            if stored_session and session_id and session_id != stored_session:
+                raise PermissionError(f"Session ownership mismatch for redo: requires {stored_session!r}")
+
+            raw_redo_files = redo_data.get("files")
+            if not isinstance(raw_redo_files, list):
+                raise ValueError("Invalid redo files list")
+        except PermissionError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Failed to parse redo manifest: {exc}") from exc
+
+        restored: list[str] = []
+        removed: list[str] = []
+        preserved: list[str] = []
+        errors: list[str] = []
+
+        for item in raw_redo_files:
+            if not isinstance(item, dict):
+                continue
+            rel_path = item.get("path")
+            if not isinstance(rel_path, str) or not _is_safe_rel_path(rel_path) or is_sensitive_path(rel_path):
+                continue
+
+            existed_pre_undo = bool(item.get("existed_pre_undo"))
+            pre_undo_hash = item.get("pre_undo_hash")
+            existed_post_undo = bool(item.get("existed_post_undo"))
+            expected_post_undo_hash = item.get("expected_post_undo_hash")
+
+            try:
+                target = self.workspace.resolve(rel_path, for_write=True)
+            except SafetyError as exc:
+                errors.append(f"SafetyError for {rel_path}: {exc}")
+                preserved.append(rel_path)
+                continue
+
+            current_exists = target.exists() and not target.is_symlink() and target.is_file()
+            current_hash = None
+            if current_exists:
+                try:
+                    current_hash = _file_hash(target.read_bytes())
+                except OSError:
+                    pass
+
+            # CONFLICT DETECTION: check if user modified the file after Undo
+            conflict = False
+            if existed_post_undo != current_exists:
+                conflict = True
+            elif current_exists and expected_post_undo_hash is not None and current_hash != expected_post_undo_hash:
+                conflict = True
+
+            if conflict:
+                preserved.append(f"{rel_path} (preserved_due_to_conflict_after_undo)")
+                continue
+
+            # Perform Redo
+            if existed_pre_undo:
+                try:
+                    redo_snap_file = (redo_snapshots / rel_path).resolve()
+                except Exception:
+                    errors.append(f"Invalid redo snapshot path for {rel_path}")
+                    preserved.append(rel_path)
+                    continue
+
+                if redo_snapshots not in redo_snap_file.parents and redo_snap_file != redo_snapshots:
+                    errors.append(f"Redo snapshot path traversal attempt blocked for {rel_path}")
+                    preserved.append(rel_path)
+                    continue
+
+                if redo_snap_file.exists() and redo_snap_file.is_file():
+                    try:
+                        if target.is_symlink():
+                            target.unlink()
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(redo_snap_file, target)
+                        restored.append(rel_path)
+                    except OSError as exc:
+                        errors.append(f"Failed to redo restore {rel_path}: {exc}")
+                        preserved.append(rel_path)
+                else:
+                    errors.append(f"Redo snapshot missing for {rel_path}")
+                    preserved.append(rel_path)
+            else:
+                # Pre-undo it did not exist, so Redo removes it
+                if target.exists() or target.is_symlink():
+                    try:
+                        if target.is_dir() and not target.is_symlink():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                        removed.append(rel_path)
+                    except OSError as exc:
+                        errors.append(f"Failed to redo remove {rel_path}: {exc}")
+                        preserved.append(rel_path)
+
+        # Remove consumed redo state directory
+        shutil.rmtree(redo_dir, ignore_errors=True)
+
+        # Update checkpoint status back to "active"
+        manifest_path = cp_dir / "manifest.json"
+        try:
+            mdata = json.loads(manifest_path.read_text(encoding="utf-8"))
+            mdata["metadata"]["status"] = "active"
+            manifest_path.write_text(json.dumps(mdata, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        return RedoResult(
             ok=len(errors) == 0,
             checkpoint_id=cp_id,
             restored=restored,
@@ -648,6 +875,7 @@ __all__ = [
     "Checkpoint",
     "CheckpointFile",
     "CheckpointManager",
+    "RedoResult",
     "RollbackResult",
     "is_sensitive_path",
 ]

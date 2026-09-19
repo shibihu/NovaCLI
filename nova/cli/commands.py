@@ -965,6 +965,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cp_rb.add_argument("checkpoint_id", help="Checkpoint ID")
     p_cp_rb.add_argument("--confirm", action="store_true", help="Confirm rollback")
     p_cp_rb.set_defaults(func=cmd_checkpoint)
+    p_cp_redo = cp_sub.add_parser("redo", parents=[common], help="Redo an undone checkpoint.")
+    p_cp_redo.add_argument("checkpoint_id", help="Checkpoint ID")
+    p_cp_redo.add_argument("--confirm", action="store_true", help="Confirm redo")
+    p_cp_redo.set_defaults(func=cmd_checkpoint)
     p_checkpoint.set_defaults(func=cmd_checkpoint)
 
     p_git_cmd = add("git", "Git workflow commands.")
@@ -1019,7 +1023,7 @@ def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Consol
             console.error("Missing checkpoint ID.")
             return 1
         try:
-            res = cpm.rollback(cp_id, force=getattr(args, "confirm", False))
+            res = cpm.rollback(cp_id)
             console.header(f"Rollback Checkpoint {cp_id}")
             console.write(f"Restored ({len(res.restored)}): {', '.join(res.restored) or 'none'}")
             console.write(f"Removed ({len(res.removed)}): {', '.join(res.removed) or 'none'}")
@@ -1028,6 +1032,23 @@ def cmd_checkpoint(args: argparse.Namespace, settings: Settings, console: Consol
             return 0 if res.ok else 1
         except Exception as exc:
             console.error(f"Rollback error: {exc}")
+            return 1
+
+    if subcommand == "redo":
+        cp_id = getattr(args, "checkpoint_id", "")
+        if not cp_id:
+            console.error("Missing checkpoint ID.")
+            return 1
+        try:
+            res = cpm.redo(cp_id)
+            console.header(f"Redo Checkpoint {cp_id}")
+            console.write(f"Restored ({len(res.restored)}): {', '.join(res.restored) or 'none'}")
+            console.write(f"Removed ({len(res.removed)}): {', '.join(res.removed) or 'none'}")
+            if res.preserved:
+                console.warn(f"Preserved due to conflicts ({len(res.preserved)}): {', '.join(res.preserved)}")
+            return 0 if res.ok else 1
+        except Exception as exc:
+            console.error(f"Redo error: {exc}")
             return 1
 
     return 0

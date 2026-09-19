@@ -216,6 +216,7 @@
                        '<div style="margin-top: 8px; display: flex; gap: 8px;">' +
                        '<button type="button" class="btn btn-ghost btn-view-diff" data-cp="' + esc(data.checkpoint_id) + '">View Diff</button>' +
                        '<button type="button" class="btn btn-danger btn-undo-cp" data-cp="' + esc(data.checkpoint_id) + '">Undo Changes</button>' +
+                       '<button type="button" class="btn btn-primary btn-redo-cp hidden" data-cp="' + esc(data.checkpoint_id) + '">Redo Changes</button>' +
                        '</div></div>';
         }
         agentMessage("Nova", finalHtml);
@@ -693,15 +694,43 @@
           return;
         }
         try {
-          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) });
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.sessionId }) });
           let msg = "Rollback complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
           if (res.preserved && res.preserved.length > 0) {
             msg += " (" + res.preserved.length + " files preserved due to user conflicts)";
           }
           toast(msg);
+          undoBtn.classList.add("hidden");
+          const cpBox = undoBtn.closest(".checkpoint-box");
+          const redoBtn = cpBox ? cpBox.querySelector(".btn-redo-cp") : null;
+          if (redoBtn) redoBtn.classList.remove("hidden");
         } catch (err) {
           toast("Undo failed: " + err.message);
         }
+        return;
+      }
+
+      const redoBtn = evt.target.closest(".btn-redo-cp");
+      if (redoBtn) {
+        const cpId = redoBtn.getAttribute("data-cp");
+        if (!confirm("Are you sure you want to redo changes for checkpoint " + cpId + "?")) {
+          return;
+        }
+        try {
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/redo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.sessionId }) });
+          let msg = "Redo complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
+          if (res.preserved && res.preserved.length > 0) {
+            msg += " (" + res.preserved.length + " files preserved due to post-undo conflicts)";
+          }
+          toast(msg);
+          redoBtn.classList.add("hidden");
+          const cpBox = redoBtn.closest(".checkpoint-box");
+          const uBtn = cpBox ? cpBox.querySelector(".btn-undo-cp") : null;
+          if (uBtn) uBtn.classList.remove("hidden");
+        } catch (err) {
+          toast("Redo failed: " + err.message);
+        }
+        return;
       }
     });
   }

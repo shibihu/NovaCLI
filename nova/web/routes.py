@@ -89,6 +89,11 @@ class CheckpointCreateBody(BaseModel):
     session_id: str | None = None
 
 
+
+class RedoBody(BaseModel):
+    session_id: str | None = None
+    confirm: bool = False
+
 class RollbackBody(BaseModel):
     session_id: str | None = None
     confirm: bool = False
@@ -634,6 +639,31 @@ async def rollback_checkpoint(
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+
+@router.post("/api/agent/checkpoint/{checkpoint_id}/redo")
+async def redo_checkpoint(
+    request: Request, checkpoint_id: str, body: RedoBody | None = None
+) -> dict[str, Any]:
+    """Safely redo workspace state to restore pre-undo agent changes."""
+    if not body or not body.confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Redo requires explicit confirmation (confirm=True)",
+        )
+
+    workspace = _workspace(_settings(request))
+    cpm = CheckpointManager(workspace)
+    try:
+        res = cpm.redo(checkpoint_id, session_id=body.session_id)
+        return res.to_dict()
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except (ValueError, SafetyError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
