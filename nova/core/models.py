@@ -87,6 +87,7 @@ class EventType(StrEnum):
     TOOL_RESULT = "tool_result"
     BLOCKED = "blocked"
     PROGRESS = "progress"
+    RATE_LIMIT_WAIT = "rate_limit_wait"
     FINAL = "final"
     ERROR = "error"
     CANCELLED = "cancelled"
