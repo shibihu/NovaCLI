@@ -786,6 +786,19 @@
 
   const RECONNECT_BACKOFFS = [1000, 2000, 4000, 8000, 15000];
 
+  function sendTermMsg(message) {
+    if (!termWs || termWs.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      termWs.send(JSON.stringify(message));
+      return true;
+    } catch (err) {
+      console.warn("sendTermMsg failed:", err);
+      return false;
+    }
+  }
+
   function updateTerminalStatus(state, message) {
     let bar = $("terminal-status-bar");
     const container = $("view-term");

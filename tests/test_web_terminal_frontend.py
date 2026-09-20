@@ -122,3 +122,33 @@ def test_terminal_container_is_the_only_input_surface():
     assert APP_JS.count("new Terminal(") == 1
     # Terminal input flows through WebSocket frames, never through a DOM field.
     assert "document.createElement(\"input\")" not in APP_JS
+
+
+# ---------------------------------------------------------------------------
+# sendTermMsg tests
+# ---------------------------------------------------------------------------
+
+
+def test_send_term_msg_is_defined():
+    assert "function sendTermMsg(" in APP_JS, "sendTermMsg helper is missing in app.js"
+
+
+def test_send_term_msg_checks_websocket_open_state():
+    assert "termWs.readyState === WebSocket.OPEN" in APP_JS
+    assert "JSON.stringify(message)" in APP_JS
+    assert "termWs.send(" in APP_JS
+
+
+def test_send_term_msg_catches_errors_and_returns_boolean():
+    send_block = APP_JS[APP_JS.index("function sendTermMsg("):]
+    send_block = send_block[:send_block.index("function updateTerminalStatus")]
+    assert "try {" in send_block
+    assert "catch (" in send_block
+    assert "return true" in send_block
+    assert "return false" in send_block
+
+
+def test_terminal_events_use_send_term_msg():
+    assert 'sendTermMsg({ type: "input", data: data });' in APP_JS
+    assert 'sendTermMsg({ type: "resize", cols: size.cols, rows: size.rows });' in APP_JS
+    assert 'sendTermMsg({ type: "resize", cols: cols, rows: rows });' in APP_JS

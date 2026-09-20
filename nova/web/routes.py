@@ -11,7 +11,7 @@ import shlex
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from nova.ai import AIProviderError, get_provider
@@ -159,6 +159,12 @@ def _workspace(settings: Settings) -> Workspace:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+
+
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """Return empty 204 response for favicon requests."""
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
