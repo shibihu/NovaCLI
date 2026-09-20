@@ -43,6 +43,11 @@ def read_sse(client: TestClient, url: str) -> list[dict]:
 # --- Shell ------------------------------------------------------------------
 
 
+def test_favicon_returns_204(client: TestClient) -> None:
+    response = client.get("/favicon.ico")
+    assert response.status_code == 204
+
+
 def test_index_serves_html(client: TestClient) -> None:
     response = client.get("/")
     assert response.status_code == 200
