@@ -113,6 +113,8 @@ def test_websocket_terminal_authorized_header(auth_app):
     client = TestClient(auth_app)
     headers = {"Authorization": f"Bearer {SECRET_TOKEN}"}
     with client.websocket_connect("/ws/terminal", headers=headers) as websocket:
+        msg = websocket.receive_json()
+        assert msg.get("type") == "connected"
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json().get("type") == "pong"
 
@@ -185,6 +187,8 @@ def test_websocket_terminal_ping_pong(tmp_path: Path):
     client = _make_client(tmp_path)
 
     with client.websocket_connect("/ws/terminal") as websocket:
+        msg = websocket.receive_json()
+        assert msg.get("type") == "connected"
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json().get("type") == "pong"
 
@@ -249,11 +253,13 @@ def test_websocket_terminal_cleans_up_session_on_disconnect(tmp_path: Path):
     client = _make_client(tmp_path)
 
     with client.websocket_connect("/ws/terminal") as websocket:
-        websocket.send_json({"type": "ping"})
-        assert websocket.receive_json().get("type") == "pong"
+        msg = websocket.receive_json()
+        assert msg.get("type") == "connected"
         assert terminal_module.pty_manager.sessions
+        websocket.send_json({"type": "input", "data": "exit\r"})
+        _wait_for_exit(websocket)
 
-    # The server closes the PTY in its finally block once the socket drops.
+    # Once shell exits, session is closed
     for _ in range(50):
         if not terminal_module.pty_manager.sessions:
             break

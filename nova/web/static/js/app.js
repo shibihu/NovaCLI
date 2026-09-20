@@ -268,6 +268,7 @@
           finalHtml += '<div class="checkpoint-box" style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 6px;">' +
                        '<div><strong>Checkpoint:</strong> <span style="font-weight: 600;">' + esc(cpName) + '</span> <code class="muted">(' + esc(data.checkpoint_id) + ')</code> <span class="muted">(' + changed.length + ' changed files)</span></div>' +
                        '<div style="margin-top: 8px; display: flex; gap: 8px;">' +
+                       '<button type="button" class="btn btn-ghost btn-rename-cp" data-cp="' + esc(data.checkpoint_id) + '">Rename</button>' +
                        '<button type="button" class="btn btn-ghost btn-view-diff" data-cp="' + esc(data.checkpoint_id) + '">View Diff</button>' +
                        '<button type="button" class="btn btn-danger btn-undo-cp" data-cp="' + esc(data.checkpoint_id) + '">Undo Changes</button>' +
                        '<button type="button" class="btn btn-primary btn-redo-cp hidden" data-cp="' + esc(data.checkpoint_id) + '">Redo Changes</button>' +
@@ -729,6 +730,27 @@
   const msgContainer = $("messages");
   if (msgContainer) {
     msgContainer.addEventListener("click", async (evt) => {
+            const renameCpBtn = evt.target.closest(".btn-rename-cp");
+      if (renameCpBtn) {
+        const cpId = renameCpBtn.getAttribute("data-cp");
+        const newName = prompt("Enter new checkpoint name:");
+        if (!newName || !newName.trim()) return;
+        try {
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName.trim() }),
+          });
+          toast("Checkpoint renamed to: " + res.checkpoint.name);
+          const cpBox = renameCpBtn.closest(".checkpoint-box");
+          const nameSpan = cpBox ? cpBox.querySelector("span") : null;
+          if (nameSpan) nameSpan.textContent = res.checkpoint.name;
+        } catch (err) {
+          toast("Rename failed: " + err.message, "error");
+        }
+        return;
+      }
+
       const diffBtn = evt.target.closest(".btn-view-diff");
       if (diffBtn) {
         const cpId = diffBtn.getAttribute("data-cp");
