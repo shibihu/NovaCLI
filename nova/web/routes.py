@@ -400,11 +400,13 @@ async def start_agent(request: Request, body: AgentRequest) -> JSONResponse:
     if not p_sess:
         p_sess = mgr.create(task=body.task, session_id=body.session_id, model=settings.model)
 
+    reconstructed_history = p_sess.to_messages()
+
     controller = AgentController(
         auto_approve=body.auto_approve, approval_timeout=settings.approval_timeout
     )
     session = registry.create(body.task, session_id=p_sess.id, controller=controller, model=settings.model)
-    registry.start(session, _agent_factory(settings), storage_manager=mgr)
+    registry.start(session, _agent_factory(settings), history=reconstructed_history, storage_manager=mgr)
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -686,11 +688,26 @@ async def list_checkpoints(
     request: Request,
     session_id: str | None = Query(None, max_length=64),
 ) -> dict[str, Any]:
-    """List all agent checkpoints in workspace for session."""
+    """List all agent checkpoints in workspace for session with size and file count metadata."""
     workspace = _workspace(_settings(request))
     cpm = CheckpointManager(workspace)
     cps = cpm.list(session_id=session_id)
-    return {"checkpoints": [cp.to_dict() for cp in cps]}
+    result = []
+    for cp in cps:
+        d = cp.to_dict()
+        cp_dir = cpm.checkpoints_dir / cp.id
+        size_bytes = 0
+        if cp_dir.exists():
+            for p in cp_dir.rglob("*"):
+                if p.is_file():
+                    try:
+                        size_bytes += p.stat().st_size
+                    except OSError:
+                        pass
+        d["size_bytes"] = size_bytes
+        d["file_count"] = len(cp.files)
+        result.append(d)
+    return {"checkpoints": result}
 
 
 @router.get("/api/agent/checkpoint/{checkpoint_id}")

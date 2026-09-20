@@ -68,15 +68,30 @@ _PERMANENT_PATTERNS = (
 
 def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitInfo:
     """Extract structured provider rate limit details from exception or HTTP metadata."""
+    p_name = provider_name
+    p_model = ""
+    retry_after = 0
+    is_perm = False
+
+    if isinstance(exc, AIProviderError):
+        if exc.provider:
+            p_name = exc.provider
+        if exc.model:
+            p_model = exc.model
+        if exc.retry_after is not None and exc.retry_after > 0:
+            retry_after = exc.retry_after
+        if exc.is_permanent:
+            is_perm = True
+
     msg = str(exc).lower()
 
-    if any(p in msg for p in _PERMANENT_PATTERNS):
+    if is_perm or any(p in msg for p in _PERMANENT_PATTERNS):
         if any(p in msg for p in ("quota", "billing", "daily", "monthly")):
             return RateLimitInfo(
                 is_rate_limit=True,
                 retry_after=0,
                 limit_type="DAILY_QUOTA" if "daily" in msg else "BILLING",
-                provider=provider_name,
+                provider=p_name,
                 reason="Quota or billing limit exhausted",
                 is_permanent=True,
             )
@@ -84,25 +99,25 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
             is_rate_limit=False,
             retry_after=0,
             limit_type="PERMANENT",
-            provider=provider_name,
+            provider=p_name,
             reason="Authentication or authorization failed",
             is_permanent=True,
         )
 
     is_rl = ("rate limit" in msg or "429" in msg or "too many requests" in msg
              or "tpm" in msg or "rpm" in msg or "resource_exhausted" in msg)
-    if not is_rl:
-        return RateLimitInfo(is_rate_limit=False, provider=provider_name)
+    if not is_rl and not retry_after and not (isinstance(exc, AIProviderError) and exc.status_code == 429):
+        return RateLimitInfo(is_rate_limit=False, provider=p_name)
 
     limit_type = "TPM" if "tpm" in msg or "token" in msg else "RPM"
 
-    retry_after = 0
-    match = re.search(r"(?:retry\s+after|try\s+again\s+in|resets?\s+in|wait)\s+(\d+)\s*s?", msg)
-    if match:
-        try:
-            retry_after = int(match.group(1))
-        except ValueError:
-            retry_after = 0
+    if not retry_after:
+        match = re.search(r"(?:retry\s+after|try\s+again\s+in|resets?\s+in|wait)\s+(\d+)\s*s?", msg)
+        if match:
+            try:
+                retry_after = int(match.group(1))
+            except ValueError:
+                retry_after = 0
 
     if not retry_after:
         match_sec = re.search(r"(\d+)\s*seconds?", msg)
@@ -116,7 +131,7 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
         is_rate_limit=True,
         retry_after=retry_after,
         limit_type=limit_type,
-        provider=provider_name,
+        provider=p_name,
         reason=f"Per-minute {limit_type} rate limit reached",
         is_permanent=False,
     )
@@ -124,6 +139,25 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
 
 class AIProviderError(Exception):
     """Any provider failure, already sanitised of secrets."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: int | None = None,
+        provider: str = "",
+        model: str = "",
+        error_code: str | None = None,
+        is_permanent: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.provider = provider
+        self.model = model
+        self.error_code = error_code
+        self.is_permanent = is_permanent
 
 
 class MissingAPIKeyError(AIProviderError):

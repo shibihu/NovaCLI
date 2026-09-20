@@ -492,12 +492,65 @@
     }
   });
 
-  // --- Interactive PTY Terminal (xterm.js + WebSocket) -------------------
+  // --- Interactive PTY Terminal (xterm.js + WebSocket with Auto-Reconnect) ---
 
   let termInstance = null;
   let fitAddon = null;
   let termWs = null;
   let ctrlActive = false;
+  let activeTerminalSessionId = null;
+  let termReconnectAttempts = 0;
+  let termReconnectTimer = null;
+  let ptyExited = false;
+  let isConnectingWs = false;
+
+  const RECONNECT_BACKOFFS = [1000, 2000, 4000, 8000, 15000];
+
+  function updateTerminalStatus(state, message) {
+    let bar = $("terminal-status-bar");
+    const container = $("view-term");
+    if (!bar && container) {
+      bar = document.createElement("div");
+      bar.id = "terminal-status-bar";
+      bar.className = "terminal-status-bar hidden";
+      container.insertBefore(bar, container.firstChild);
+    }
+    if (!bar) return;
+
+    if (state === "connected") {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+    } else {
+      bar.classList.remove("hidden");
+      bar.className = "terminal-status-bar status-" + state;
+      let btnHtml = "";
+      if (state === "disconnected") {
+        btnHtml = ' <button type="button" class="btn btn-ghost small" id="btn-reconnect-term" style="margin-left: 8px; padding: 2px 8px;">Reconnect</button>';
+      } else if (state === "exited") {
+        btnHtml = ' <button type="button" class="btn btn-ghost small" id="btn-new-term" style="margin-left: 8px; padding: 2px 8px;">New Terminal</button>';
+      }
+      bar.innerHTML = esc(message) + btnHtml;
+
+      const recBtn = $("btn-reconnect-term");
+      if (recBtn) {
+        recBtn.addEventListener("click", () => {
+          termReconnectAttempts = 0;
+          connectTerminalWs();
+        });
+      }
+
+      const newBtn = $("btn-new-term");
+      if (newBtn) {
+        newBtn.addEventListener("click", () => {
+          ptyExited = false;
+          activeTerminalSessionId = null;
+          termReconnectAttempts = 0;
+          if (termInstance) termInstance.clear();
+          connectTerminalWs();
+        });
+      }
+    }
+  }
 
   function initTerminal() {
     const container = $("terminal-container");
@@ -513,8 +566,6 @@
           foreground: "#c9d1d9",
           cursor: "#58a6ff",
         },
-        // A real PTY/ConPTY already emits CRLF and cursor positioning. Rewriting
-        // line endings here would corrupt full-screen and interactive programs.
         convertEol: false,
       });
 
@@ -526,18 +577,13 @@
       termInstance.open(container);
       if (fitAddon) fitAddon.fit();
 
-      // Focus the real xterm surface (an off-screen textarea owned by xterm.js).
-      // Without this the terminal renders but keystrokes have nowhere to go.
       termInstance.focus();
 
-      // The container only reaches its final size after the tab is laid out, so
-      // re-fit and re-focus once the browser has settled.
       setTimeout(() => {
         if (fitAddon) fitAddon.fit();
         if (termInstance) termInstance.focus();
       }, 50);
 
-      // Tapping the terminal focuses xterm directly (desktop and mobile).
       container.addEventListener("pointerdown", () => {
         if (termInstance) termInstance.focus();
       });
@@ -566,39 +612,88 @@
           fitAddon.fit();
         }
       });
+
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          checkAndReconnectTerminal();
+        }
+      });
+
+      window.addEventListener("beforeunload", () => {
+        if (termReconnectTimer) clearTimeout(termReconnectTimer);
+        if (termWs) {
+          termWs.onclose = null;
+          termWs.close();
+        }
+      });
     } else if (termInstance) {
       setTimeout(() => {
         if (fitAddon) fitAddon.fit();
         termInstance.focus();
       }, 50);
+      checkAndReconnectTerminal();
     }
   }
 
   function connectTerminalWs() {
+    if (ptyExited) return;
     if (termWs && (termWs.readyState === WebSocket.OPEN || termWs.readyState === WebSocket.CONNECTING)) {
       return;
     }
+    if (isConnectingWs) return;
+
+    if (termReconnectTimer) {
+      clearTimeout(termReconnectTimer);
+      termReconnectTimer = null;
+    }
+
+    const termView = $("view-term");
+    const isTermActive = termView && termView.classList.contains("is-active");
+    if (document.hidden && !isTermActive) {
+      return;
+    }
+
+    isConnectingWs = true;
+    updateTerminalStatus("connecting", "Terminal connecting…");
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const cols = termInstance ? termInstance.cols : 80;
     const rows = termInstance ? termInstance.rows : 24;
-    const wsUrl = protocol + "//" + location.host + "/ws/terminal?cols=" + cols + "&rows=" + rows;
+    let wsUrl = protocol + "//" + location.host + "/ws/terminal?cols=" + cols + "&rows=" + rows;
+    if (activeTerminalSessionId) {
+      wsUrl += "&session_id=" + encodeURIComponent(activeTerminalSessionId);
+    }
 
     try {
-      termWs = new WebSocket(wsUrl);
+      const ws = new WebSocket(wsUrl);
+      termWs = ws;
 
-      termWs.onopen = () => {
+      ws.onopen = () => {
+        isConnectingWs = false;
+        if (termWs !== ws) return;
+        termReconnectAttempts = 0;
+        updateTerminalStatus("connected", "Connected");
         if (fitAddon && termInstance) fitAddon.fit();
         if (termInstance) termInstance.focus();
+        sendTermMsg({ type: "resize", cols: cols, rows: rows });
       };
 
-      termWs.onmessage = (event) => {
+      ws.onmessage = (event) => {
+        if (termWs !== ws) return;
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === "output" && termInstance) {
+          if (msg.type === "connected") {
+            if (msg.session_id) {
+              activeTerminalSessionId = msg.session_id;
+            }
+          } else if (msg.type === "output" && termInstance) {
             termInstance.write(msg.data);
-          } else if (msg.type === "exit" && termInstance) {
-            termInstance.write("\r\n\x1b[33m[Process exited with code " + msg.code + "]\x1b[0m\r\n");
+          } else if (msg.type === "exit") {
+            ptyExited = true;
+            updateTerminalStatus("exited", "Terminal process exited");
+            if (termInstance) {
+              termInstance.write("\r\n\x1b[33m[Terminal process exited with code " + msg.code + "]\x1b[0m\r\n");
+            }
           } else if (msg.type === "error" && termInstance) {
             termInstance.write("\r\n\x1b[31m[Error: " + esc(msg.message) + "]\x1b[0m\r\n");
           }
@@ -607,20 +702,54 @@
         }
       };
 
-      termWs.onclose = () => {
-        if (termInstance) {
-          termInstance.write("\r\n\x1b[33m[Terminal disconnected. Switch tab or refresh to reconnect.]\x1b[0m\r\n");
+      ws.onclose = () => {
+        isConnectingWs = false;
+        if (termWs === ws) {
+          termWs = null;
         }
-        termWs = null;
+        if (ptyExited) return;
+        scheduleTerminalReconnect();
+      };
+
+      ws.onerror = () => {
+        isConnectingWs = false;
       };
     } catch (err) {
-      if (termInstance) termInstance.write("\r\n\x1b[31m[WebSocket connection failed: " + err.message + "]\x1b[0m\r\n");
+      isConnectingWs = false;
+      if (!ptyExited) {
+        scheduleTerminalReconnect();
+      }
     }
   }
 
-  function sendTermMsg(msg) {
-    if (termWs && termWs.readyState === WebSocket.OPEN) {
-      termWs.send(JSON.stringify(msg));
+  function scheduleTerminalReconnect() {
+    if (ptyExited) return;
+    if (termReconnectTimer) {
+      clearTimeout(termReconnectTimer);
+      termReconnectTimer = null;
+    }
+
+    const delay = RECONNECT_BACKOFFS[Math.min(termReconnectAttempts, RECONNECT_BACKOFFS.length - 1)];
+    termReconnectAttempts++;
+
+    const delaySec = Math.round(delay / 1000);
+    updateTerminalStatus("disconnected", "Terminal disconnected — reconnecting in " + delaySec + "s…");
+
+    termReconnectTimer = setTimeout(() => {
+      termReconnectTimer = null;
+      connectTerminalWs();
+    }, delay);
+  }
+
+  function checkAndReconnectTerminal() {
+    if (ptyExited) return;
+    const termView = $("view-term");
+    const isTermActive = termView && termView.classList.contains("is-active");
+    if (!isTermActive) return;
+
+    if (!termWs || termWs.readyState === WebSocket.CLOSED || termWs.readyState === WebSocket.CLOSING) {
+      termReconnectAttempts = 0;
+      connectTerminalWs();
     }
   }
 

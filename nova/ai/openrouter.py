@@ -120,7 +120,20 @@ class OpenRouterProvider:
                 raise MissingAPIKeyError(f"OpenRouter rejected the API key (HTTP {resp.status_code}). {MISSING_KEY_HINT}")
             if resp.status_code != 200:
                 error_body = self._sanitize(resp.text[:300])
-                raise AIProviderError(f"OpenRouter returned HTTP {resp.status_code}: {error_body}")
+                ra_val = resp.headers.get("retry-after")
+                retry_after = None
+                if ra_val:
+                    try:
+                        retry_after = int(float(ra_val))
+                    except (ValueError, TypeError):
+                        pass
+                raise AIProviderError(
+                    f"OpenRouter returned HTTP {resp.status_code}: {error_body}",
+                    status_code=resp.status_code,
+                    retry_after=retry_after,
+                    provider="openrouter",
+                    model=self._model,
+                )
 
             data = resp.json()
             return self._extract_response(data)

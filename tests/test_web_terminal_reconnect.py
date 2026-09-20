@@ -117,3 +117,40 @@ def test_terminal_reconnect_nonexistent_session_creates_new(tmp_path: Path):
 
     # Cleanup
     terminal_module.pty_manager.close(new_id)
+
+
+def test_terminal_output_buffer_replay_on_reconnect(tmp_path: Path):
+    terminal_module.pty_manager.clear()
+    client = _make_client(tmp_path)
+
+    # 1. Connect and write output
+    session_id = None
+    with client.websocket_connect("/ws/terminal") as ws1:
+        msg = ws1.receive_json()
+        assert msg.get("type") == "connected"
+        session_id = msg.get("session_id")
+
+        ws1.send_json({"type": "input", "data": "echo replay_marker_12345\r"})
+        output_text = ""
+        for _ in range(20):
+            ws1.send_json({"type": "ping"})
+            m = ws1.receive_json()
+            if m.get("type") == "output":
+                output_text += m.get("data", "")
+                if "replay_marker_12345" in output_text:
+                    break
+            elif m.get("type") == "pong":
+                time.sleep(0.05)
+        assert "replay_marker_12345" in output_text
+
+    # 2. Reconnect and verify buffered output is replayed
+    with client.websocket_connect(f"/ws/terminal?session_id={session_id}") as ws2:
+        m1 = ws2.receive_json()
+        assert m1.get("type") == "connected"
+
+        # Next frame is buffered output replay
+        m2 = ws2.receive_json()
+        assert m2.get("type") == "output"
+        assert "replay_marker_12345" in m2.get("data", "")
+
+    terminal_module.pty_manager.close(session_id)

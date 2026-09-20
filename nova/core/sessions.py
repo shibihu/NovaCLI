@@ -74,6 +74,103 @@ class ChatSession:
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(asdict(self))
 
+    def to_messages(self) -> list[Any]:
+        """Reconstruct canonical list of Message objects from session history."""
+        from nova.core.models import Message
+        messages: list[Message] = []
+        raw_items = self.messages
+        if not raw_items:
+            return messages
+
+        current_tool_calls = []
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+
+            role = item.get("role")
+            if role in ("user", "system"):
+                if item.get("content"):
+                    messages.append(Message(role=role, content=str(item["content"])))
+                continue
+            elif role == "assistant":
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=item.get("content"),
+                        tool_calls=item.get("tool_calls"),
+                    )
+                )
+                continue
+            elif role == "tool":
+                messages.append(
+                    Message(
+                        role="tool",
+                        content=str(item.get("content", "")),
+                        tool_call_id=item.get("tool_call_id"),
+                        name=item.get("name"),
+                    )
+                )
+                continue
+
+            evt_type = item.get("type")
+            data = item.get("data") or {}
+
+            if evt_type == "agent_start":
+                task_text = data.get("task")
+                if task_text and not messages:
+                    messages.append(Message.user(str(task_text)))
+
+            elif evt_type == "thought":
+                text = data.get("text")
+                if text:
+                    messages.append(Message.assistant(content=str(text)))
+
+            elif evt_type == "tool_call":
+                tc_id = data.get("id") or f"call_{len(messages)}"
+                t_name = data.get("tool") or data.get("name") or "tool"
+                t_input = data.get("input") or {}
+
+                raw_args = json.dumps(t_input) if isinstance(t_input, dict) else str(t_input)
+                tc_dict = {
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": t_name,
+                        "arguments": raw_args,
+                    },
+                }
+                if data.get("thought_signature"):
+                    tc_dict["thought_signature"] = data["thought_signature"]
+                    tc_dict["function"]["thought_signature"] = data["thought_signature"]
+
+                current_tool_calls.append(tc_dict)
+
+            elif evt_type in ("tool_result", "blocked"):
+                if current_tool_calls:
+                    messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
+                    current_tool_calls.clear()
+
+                tc_id = data.get("tool_call_id") or data.get("id") or f"call_{len(messages)}"
+                t_name = data.get("name") or data.get("tool") or "tool"
+                t_out = data.get("output") or data.get("reason") or data.get("error") or ""
+                messages.append(Message.tool_result(tc_id, t_name, str(t_out)))
+
+            elif evt_type == "final":
+                if current_tool_calls:
+                    messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
+                    current_tool_calls.clear()
+                answer = data.get("answer")
+                if answer:
+                    messages.append(Message.assistant(content=str(answer)))
+
+        if current_tool_calls:
+            messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
+            current_tool_calls.clear()
+
+        return messages
+
+
 
 class SessionStorageManager:
     """Manages persistent chat session storage in .nova/sessions/."""

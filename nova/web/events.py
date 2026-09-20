@@ -193,7 +193,7 @@ class SessionRegistry:
 
     # -- Running ---------------------------------------------------------
 
-    async def run_session(self, session: AgentSession, factory: AgentFactory, storage_manager: Any = None) -> None:
+    async def run_session(self, session: AgentSession, factory: AgentFactory, history: Any = None, storage_manager: Any = None) -> None:
         """Drive the agent for ``session``, publishing every event.
 
         Runs as a background task so the HTTP request that created the session
@@ -205,7 +205,7 @@ class SessionRegistry:
             agent = factory()
             session.model = agent.provider.model_name
             # The agent itself emits AGENT_START, so we do not synthesise one.
-            async for event in agent.stream(session.task, controller=session.controller):
+            async for event in agent.stream(session.task, history=history, controller=session.controller):
                 session.publish(event)
                 if event.type == EventType.AGENT_START:
                     session.checkpoint_id = event.data.get("checkpoint_id")
@@ -261,9 +261,9 @@ class SessionRegistry:
                 except Exception:  # noqa: BLE001 - cleanup is best effort
                     pass
 
-    def start(self, session: AgentSession, factory: AgentFactory, storage_manager: Any = None) -> asyncio.Task[Any]:
+    def start(self, session: AgentSession, factory: AgentFactory, history: Any = None, storage_manager: Any = None) -> asyncio.Task[Any]:
         """Schedule :meth:`run_session` and remember the task."""
-        task = asyncio.create_task(self.run_session(session, factory, storage_manager=storage_manager))
+        task = asyncio.create_task(self.run_session(session, factory, history=history, storage_manager=storage_manager))
         session.run_task = task
         return task
 
