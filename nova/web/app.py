@@ -16,6 +16,30 @@ TEMPLATES_DIR = WEB_ROOT / "templates"
 STATIC_DIR = WEB_ROOT / "static"
 
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    import asyncio
+    from nova.web.terminal import pty_manager
+
+    async def _cleanup_loop():
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                pty_manager.cleanup_orphans()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    try:
+        yield
+    finally:
+        if not cleanup_task.done():
+            cleanup_task.cancel()
+
 def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     """Build the FastAPI application.
 
@@ -35,6 +59,7 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     settings = settings or load_settings()
 
     app = FastAPI(
+        lifespan=lifespan,
         title="NovaCLI",
         version=__version__,
         description="AI-powered developer environment — agent, CLI and mobile web IDE.",
@@ -128,6 +153,9 @@ def create_app(settings: Settings | None = None) -> "FastAPI":  # noqa: F821
     app.include_router(terminal_router)
     app.include_router(router)
     register_exception_handlers(app)
+
+
+
     return app
 
 

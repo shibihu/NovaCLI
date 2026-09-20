@@ -44,6 +44,18 @@ class PTYSession(ABC):
         self.env = dict(env) if env else {}
         self._closed = False
         self.disconnected_at: float | None = None
+        self.output_buffer = bytearray()
+
+    def append_output(self, data: bytes) -> None:
+        if not data:
+            return
+        self.output_buffer.extend(data)
+        if len(self.output_buffer) > 32_768:
+            overflow = len(self.output_buffer) - 32_768
+            del self.output_buffer[:overflow]
+
+    def get_recent_output(self) -> str:
+        return self.output_buffer.decode("utf-8", errors="replace")
 
     @property
     @abstractmethod

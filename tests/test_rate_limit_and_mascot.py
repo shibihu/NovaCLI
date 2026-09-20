@@ -121,3 +121,14 @@ async def test_rate_limit_cancellation_during_wait(tmp_path: Path):
     event_types = [e.type for e in events]
     assert EventType.RATE_LIMIT_WAIT in event_types
     assert EventType.CANCELLED in event_types
+
+
+def test_aiprovidererror_metadata():
+    err = AIProviderError(
+        "Groq 429", status_code=429, retry_after=17, provider="groq", model="openai/gpt-oss-20b"
+    )
+    rl = parse_rate_limit_info(err)
+    assert rl.is_rate_limit is True
+    assert rl.retry_after == 17
+    assert rl.provider == "groq"
+    assert rl.is_permanent is False

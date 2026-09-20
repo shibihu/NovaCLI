@@ -139,7 +139,27 @@ class GroqProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise AIProviderError(self._describe_error(exc)) from exc
+            status_code = getattr(exc, "status_code", None)
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None) if response else None
+
+            retry_after = None
+            if headers:
+                ra_val = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+                if ra_val:
+                    try:
+                        retry_after = int(float(ra_val))
+                    except (ValueError, TypeError):
+                        pass
+
+            desc = self._describe_error(exc)
+            raise AIProviderError(
+                desc,
+                status_code=status_code or (429 if "429" in str(exc) else None),
+                retry_after=retry_after,
+                provider="groq",
+                model=self._model,
+            ) from exc
 
         return self._extract_response(response)
 

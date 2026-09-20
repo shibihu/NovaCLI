@@ -127,3 +127,62 @@ def test_session_workspace_isolation(tmp_path: Path):
     # Invalid session ID with path traversal
     res_traversal = client.get("/api/agent/sessions/.._.._etc_passwd")
     assert res_traversal.status_code == 404
+
+
+def test_session_to_messages_reconstruction(tmp_path: Path):
+    ws = Workspace(tmp_path)
+    mgr = SessionStorageManager(ws)
+
+    sess = mgr.create(task="Fix Ollama tool calling", model="openai/gpt-oss-20b")
+    sess.messages = [
+        {
+            "type": "agent_start",
+            "data": {"task": "Fix Ollama tool calling", "model": "openai/gpt-oss-20b"}
+        },
+        {
+            "type": "thought",
+            "data": {"text": "I will search for ollama provider file."}
+        },
+        {
+            "type": "tool_call",
+            "data": {
+                "id": "call_123",
+                "tool": "search",
+                "input": {"query": "ollama"},
+                "thought_signature": "sig_google_gemini_123"
+            }
+        },
+        {
+            "type": "tool_result",
+            "data": {
+                "tool_call_id": "call_123",
+                "name": "search",
+                "output": "Found nova/ai/ollama.py"
+            }
+        },
+        {
+            "type": "final",
+            "data": {"answer": "Fixed Ollama tool calling."}
+        }
+    ]
+    mgr.save(sess)
+
+    loaded = mgr.get(sess.id)
+    assert loaded is not None
+
+    messages = loaded.to_messages()
+    assert len(messages) == 5
+    assert messages[0].role == "user"
+    assert messages[0].content == "Fix Ollama tool calling"
+
+    assert messages[1].role == "assistant"
+    assert messages[1].content == "I will search for ollama provider file."
+
+    assert messages[2].role == "assistant"
+    assert messages[2].tool_calls is not None
+    assert messages[2].tool_calls[0]["id"] == "call_123"
+    assert messages[2].tool_calls[0]["thought_signature"] == "sig_google_gemini_123"
+
+    assert messages[3].role == "tool"
+    assert messages[3].tool_call_id == "call_123"
+    assert "nova/ai/ollama.py" in messages[3].content

@@ -123,6 +123,8 @@ async def _pump_pty_output(websocket: WebSocket, session) -> None:
             if not data:
                 await asyncio.sleep(0.02)
                 continue
+            if hasattr(session, "append_output"):
+                session.append_output(data)
             if not await _safe_send_json(
                 websocket,
                 {"type": "output", "data": data.decode("utf-8", errors="replace")},
@@ -246,6 +248,10 @@ async def terminal_websocket(websocket: WebSocket) -> None:
             return
 
     await _safe_send_json(websocket, {"type": "connected", "session_id": session.id})
+    if hasattr(session, "get_recent_output"):
+        recent = session.get_recent_output()
+        if recent:
+            await _safe_send_json(websocket, {"type": "output", "data": recent})
 
     # Pump output and input concurrently. Whichever finishes first ends the
     # session: the shell exiting tears down the socket, and the client
