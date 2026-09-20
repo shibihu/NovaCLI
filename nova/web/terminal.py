@@ -33,6 +33,7 @@ import time
 import contextlib
 import json
 import logging
+import sys
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from nova.core.safety import redact_secrets
@@ -161,7 +162,13 @@ async def _pump_pty_output(websocket: WebSocket, session) -> None:
 async def _terminal_input_loop(websocket: WebSocket, session) -> None:
     """Forward client messages into the PTY until the shell exits."""
     while session.is_alive:
-        raw_msg = await websocket.receive_text()
+        try:
+            raw_msg = await websocket.receive_text()
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            return
+        except Exception as exc:
+            logger.debug("PTY input loop exception (session %s): %s", session.id, exc)
+            return
         if not raw_msg:
             continue
 
@@ -278,6 +285,14 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        logger.info(
+            "Terminal session disconnected (session_id=%s, platform=%s, shell=%s, alive=%s, returncode=%s)",
+            session.id,
+            sys.platform,
+            getattr(session, "shell_path", "unknown"),
+            session.is_alive,
+            session.returncode if not session.is_alive else None,
+        )
         if not session.is_alive:
             pty_manager.close(session.id)
         else:

@@ -154,3 +154,31 @@ def test_terminal_output_buffer_replay_on_reconnect(tmp_path: Path):
         assert "replay_marker_12345" in m2.get("data", "")
 
     terminal_module.pty_manager.close(session_id)
+
+
+def test_terminal_websocket_disconnect_logging(tmp_path: Path, caplog):
+    import logging
+    terminal_module.pty_manager.clear()
+    client = _make_client(tmp_path)
+
+    with caplog.at_level(logging.INFO):
+        with client.websocket_connect("/ws/terminal") as ws:
+            msg = ws.receive_json()
+            assert msg.get("type") == "connected"
+
+    assert "Terminal session disconnected" in caplog.text
+
+
+def test_terminal_input_loop_handles_disconnect_gracefully(tmp_path: Path):
+    terminal_module.pty_manager.clear()
+    client = _make_client(tmp_path)
+
+    with client.websocket_connect("/ws/terminal") as ws:
+        msg = ws.receive_json()
+        sid = msg.get("session_id")
+        ws.send_json({"type": "input", "data": "echo input_loop_ok\r"})
+
+    # Gracefully exits on disconnect without unhandled exception
+    sess = terminal_module.pty_manager.get(sid, project_root=tmp_path)
+    assert sess is not None
+    terminal_module.pty_manager.close(sid)
