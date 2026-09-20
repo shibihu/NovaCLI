@@ -72,6 +72,10 @@
     document.querySelectorAll(".view").forEach((view) => {
       view.classList.toggle("is-active", view.id === "view-" + name);
     });
+    if (name !== "term" && termReconnectTimer) {
+      clearTimeout(termReconnectTimer);
+      termReconnectTimer = null;
+    }
     document.querySelectorAll(".tab").forEach((tab) => {
       const active = tab.dataset.view === name;
       tab.classList.toggle("is-active", active);
@@ -784,6 +788,7 @@
   let ptyExited = false;
   let isConnectingWs = false;
 
+  const MAX_TERMINAL_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_BACKOFFS = [1000, 2000, 4000, 8000, 15000];
 
   function sendTermMsg(message) {
@@ -827,6 +832,10 @@
       const recBtn = $("btn-reconnect-term");
       if (recBtn) {
         recBtn.addEventListener("click", () => {
+          if (termReconnectTimer) {
+            clearTimeout(termReconnectTimer);
+            termReconnectTimer = null;
+          }
           termReconnectAttempts = 0;
           connectTerminalWs();
         });
@@ -835,6 +844,10 @@
       const newBtn = $("btn-new-term");
       if (newBtn) {
         newBtn.addEventListener("click", () => {
+          if (termReconnectTimer) {
+            clearTimeout(termReconnectTimer);
+            termReconnectTimer = null;
+          }
           ptyExited = false;
           activeTerminalSessionId = null;
           termReconnectAttempts = 0;
@@ -1020,6 +1033,17 @@
     if (termReconnectTimer) {
       clearTimeout(termReconnectTimer);
       termReconnectTimer = null;
+    }
+
+    const termView = $("view-term");
+    const isTermActive = termView && termView.classList.contains("is-active");
+    if (document.hidden || !isTermActive) {
+      return;
+    }
+
+    if (termReconnectAttempts >= MAX_TERMINAL_RECONNECT_ATTEMPTS) {
+      updateTerminalStatus("disconnected", "Reconnect attempts exhausted");
+      return;
     }
 
     const delay = RECONNECT_BACKOFFS[Math.min(termReconnectAttempts, RECONNECT_BACKOFFS.length - 1)];

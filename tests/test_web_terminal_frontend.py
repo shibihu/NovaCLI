@@ -152,3 +152,31 @@ def test_terminal_events_use_send_term_msg():
     assert 'sendTermMsg({ type: "input", data: data });' in APP_JS
     assert 'sendTermMsg({ type: "resize", cols: size.cols, rows: size.rows });' in APP_JS
     assert 'sendTermMsg({ type: "resize", cols: cols, rows: rows });' in APP_JS
+
+
+# ---------------------------------------------------------------------------
+# Reconnect lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+def test_reconnect_max_attempts_constant_defined():
+    assert "const MAX_TERMINAL_RECONNECT_ATTEMPTS = 5;" in APP_JS
+
+
+def test_schedule_reconnect_checks_max_attempts_and_active_view():
+    sched_block = APP_JS[APP_JS.index("function scheduleTerminalReconnect()"):]
+    sched_block = sched_block[:sched_block.index("function checkAndReconnectTerminal()")]
+    assert "MAX_TERMINAL_RECONNECT_ATTEMPTS" in sched_block
+    assert "isTermActive" in sched_block
+    assert "Reconnect attempts exhausted" in sched_block
+
+
+def test_manual_reconnect_resets_attempts_and_clears_timer():
+    assert "termReconnectAttempts = 0;" in APP_JS
+    assert "clearTimeout(termReconnectTimer);" in APP_JS
+
+
+def test_tab_switch_clears_reconnect_timer():
+    show_block = APP_JS[APP_JS.index("function showView(name)"):]
+    show_block = show_block[:show_block.index('document.querySelectorAll(".tab")')]
+    assert "clearTimeout(termReconnectTimer);" in show_block
