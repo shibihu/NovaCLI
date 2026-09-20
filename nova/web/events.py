@@ -21,6 +21,7 @@ from typing import Any
 
 from nova.ai import AIProviderError
 from nova.core.agent import AgentController, NovaAgent
+from nova.core.conversation import ConversationTrace, canonical_history
 from nova.core.models import (
     AgentEvent,
     AgentResult,
@@ -32,6 +33,17 @@ from nova.core.models import (
 
 #: Heartbeat interval so mobile browsers and proxies keep the SSE stream open.
 HEARTBEAT_SECONDS = 15.0
+
+#: Events after which the canonical conversation has grown and should be
+#: flushed to disk (tool-call turns, tool results). Terminal events are flushed
+#: separately so they land before the browser sees them.
+CONVERSATION_EVENTS: frozenset[str] = frozenset(
+    {
+        EventType.TOOL_CALL.value,
+        EventType.TOOL_RESULT.value,
+        EventType.BLOCKED.value,
+    }
+)
 
 #: Sessions kept in memory before the oldest finished ones are evicted.
 MAX_SESSIONS = 40
@@ -198,38 +210,41 @@ class SessionRegistry:
 
         Runs as a background task so the HTTP request that created the session
         can return immediately and the browser can attach to the stream.
+
+        ``trace`` observes the canonical ``Message[]`` the agent builds; the
+        session is persisted from that — never from the event stream, whose
+        thought/progress notifications are display-only.
         """
         session.status = AgentStatus.RUNNING
         agent: NovaAgent | None = None
+        trace = ConversationTrace()
+        persisted = 0
         try:
             agent = factory()
             session.model = agent.provider.model_name
             # The agent itself emits AGENT_START, so we do not synthesise one.
-            async for event in agent.stream(session.task, history=history, controller=session.controller):
-                session.publish(event)
-                if event.type == EventType.AGENT_START:
-                    session.checkpoint_id = event.data.get("checkpoint_id")
-                elif event.type == EventType.APPROVAL_REQUEST:
-                    session.status = AgentStatus.WAITING_APPROVAL
-                elif event.type == EventType.APPROVAL_RESOLVED:
-                    session.status = AgentStatus.RUNNING
-                elif event.type == EventType.FINAL:
-                    session.status = AgentStatus.DONE
-                    session.checkpoint_id = str(event.data.get("checkpoint_id", "") or session.checkpoint_id or "")
-                    session.changed_files = list(event.data.get("changed_files") or [])
-                    session.result = AgentResult(
-                        task=session.task,
-                        status=AgentStatus.DONE,
-                        answer=str(event.data.get("answer", "")),
-                        model=session.model,
-                        checkpoint_id=session.checkpoint_id,
-                        changed_files=session.changed_files,
+            async for event in agent.stream(
+                session.task, history=history, controller=session.controller, trace=trace
+            ):
+                if event.type in TERMINAL_EVENTS:
+                    # Persist *before* the browser sees the terminal event, so a
+                    # UI that reloads Recent Chats on "final" reads fresh state.
+                    self.apply_event(session, event)
+                    persisted = self._persist_session(
+                        storage_manager, session, trace, touch=True
                     )
-                elif event.type == EventType.ERROR:
-                    session.status = AgentStatus.ERROR
-                    session.error = str(event.data.get("message", "unknown error"))
-                elif event.type == EventType.CANCELLED:
-                    session.status = AgentStatus.CANCELLED
+                    session.publish(event)
+                    continue
+
+                session.publish(event)
+                self.apply_event(session, event)
+                if event.type in CONVERSATION_EVENTS:
+                    # Crash safety only: the chat's ordering must not churn once
+                    # per tool step, so these intermediate writes do not touch
+                    # ``updated_at``.
+                    persisted = self._persist_session(
+                        storage_manager, session, trace, touch=False
+                    )
         except asyncio.CancelledError:
             session.status = AgentStatus.CANCELLED
             session.publish(AgentEvent(EventType.CANCELLED, {"reason": "cancelled"}))
@@ -246,20 +261,81 @@ class SessionRegistry:
             if session.status not in AgentStatus.terminal():
                 session.status = AgentStatus.DONE
             session.finished_at = time.time()
-            if storage_manager is not None:
-                try:
-                    p_sess = storage_manager.get(session.id)
-                    if p_sess:
-                        p_sess.status = str(session.status)
-                        p_sess.messages = list(session.events)
-                        storage_manager.save(p_sess)
-                except Exception:
-                    pass
+            # A run that died before its terminal event still keeps its history;
+            # an already-persisted turn must not bump ``updated_at`` twice.
+            self._persist_session(
+                storage_manager,
+                session,
+                trace,
+                touch=len(trace.messages) != persisted,
+            )
             if agent is not None:
                 try:
                     await agent.provider.aclose()
                 except Exception:  # noqa: BLE001 - cleanup is best effort
                     pass
+
+    @staticmethod
+    def apply_event(session: AgentSession, event: AgentEvent) -> None:
+        """Update the in-memory session state for one agent event."""
+        if event.type == EventType.AGENT_START:
+            session.checkpoint_id = event.data.get("checkpoint_id")
+        elif event.type == EventType.APPROVAL_REQUEST:
+            session.status = AgentStatus.WAITING_APPROVAL
+        elif event.type == EventType.APPROVAL_RESOLVED:
+            session.status = AgentStatus.RUNNING
+        elif event.type == EventType.FINAL:
+            session.status = AgentStatus.DONE
+            session.checkpoint_id = str(
+                event.data.get("checkpoint_id", "") or session.checkpoint_id or ""
+            )
+            session.changed_files = list(event.data.get("changed_files") or [])
+            session.result = AgentResult(
+                task=session.task,
+                status=AgentStatus.DONE,
+                answer=str(event.data.get("answer", "")),
+                model=session.model,
+                checkpoint_id=session.checkpoint_id,
+                changed_files=session.changed_files,
+            )
+        elif event.type == EventType.ERROR:
+            session.status = AgentStatus.ERROR
+            session.error = str(event.data.get("message", "unknown error"))
+        elif event.type == EventType.CANCELLED:
+            session.status = AgentStatus.CANCELLED
+
+    @staticmethod
+    def _persist_session(
+        storage_manager: Any,
+        session: AgentSession,
+        trace: ConversationTrace,
+        *,
+        touch: bool = True,
+    ) -> int:
+        """Write the run's canonical conversation back to persistent storage.
+
+        Returns how many canonical messages were written. ``touch`` decides
+        whether ``updated_at`` moves: exactly one logical assistant response
+        produces one timestamp update (streaming tokens never touch it).
+        """
+        if storage_manager is None:
+            return 0
+        try:
+            p_sess = storage_manager.get(session.id)
+            if p_sess is None:
+                return 0
+            written = len(trace.messages)
+            if trace.messages:
+                p_sess = storage_manager.replace_history(
+                    session.id, canonical_history(trace)
+                ) or p_sess
+            p_sess.status = str(session.status)
+            if session.model:
+                p_sess.model = session.model
+            storage_manager.save(p_sess, touch=touch)
+            return written
+        except Exception:  # noqa: BLE001 - persistence must never kill a run
+            return 0
 
     def start(self, session: AgentSession, factory: AgentFactory, history: Any = None, storage_manager: Any = None) -> asyncio.Task[Any]:
         """Schedule :meth:`run_session` and remember the task."""
@@ -325,6 +401,7 @@ async def stream_session(
 
 __all__ = [
     "AgentSession",
+    "CONVERSATION_EVENTS",
     "SessionRegistry",
     "sse_format",
     "stream_session",

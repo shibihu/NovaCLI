@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from nova.core.models import AIResponse, ToolCall
-from . import AIProviderError, MissingAPIKeyError
+from . import AIProviderError, MissingAPIKeyError, retry_after_from_headers
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TIMEOUT = 60.0
@@ -41,6 +41,10 @@ class OpenRouterProvider:
         self._timeout = max(1.0, float(timeout))
         self._client = client
         self._owns_client = client is None
+
+    @property
+    def provider_id(self) -> str:
+        return "openrouter"
 
     @property
     def model_name(self) -> str:
@@ -117,22 +121,24 @@ class OpenRouterProvider:
         try:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code in (401, 403):
-                raise MissingAPIKeyError(f"OpenRouter rejected the API key (HTTP {resp.status_code}). {MISSING_KEY_HINT}")
+                raise MissingAPIKeyError(
+                    f"OpenRouter rejected the API key (HTTP {resp.status_code}). {MISSING_KEY_HINT}",
+                    status_code=resp.status_code,
+                    provider="openrouter",
+                    model=target_model,
+                    is_permanent=True,
+                )
             if resp.status_code != 200:
                 error_body = self._sanitize(resp.text[:300])
-                ra_val = resp.headers.get("retry-after")
-                retry_after = None
-                if ra_val:
-                    try:
-                        retry_after = int(float(ra_val))
-                    except (ValueError, TypeError):
-                        pass
+                # ``Retry-After: 60`` or an HTTP-date.
                 raise AIProviderError(
                     f"OpenRouter returned HTTP {resp.status_code}: {error_body}",
                     status_code=resp.status_code,
-                    retry_after=retry_after,
+                    retry_after=retry_after_from_headers(resp.headers),
                     provider="openrouter",
-                    model=self._model,
+                    model=target_model,
+                    error_code=self._error_code(resp),
+                    is_permanent=resp.status_code in (400, 404),
                 )
 
             data = resp.json()
@@ -140,11 +146,38 @@ class OpenRouterProvider:
         except MissingAPIKeyError:
             raise
         except httpx.ConnectError as exc:
-            raise AIProviderError(f"Could not reach OpenRouter ({type(exc).__name__}): {self._sanitize(str(exc))}") from exc
+            raise AIProviderError(
+                f"Could not reach OpenRouter ({type(exc).__name__}): {self._sanitize(str(exc))}",
+                provider="openrouter",
+                model=target_model,
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise AIProviderError(f"OpenRouter request timed out after {self._timeout:.0f}s.") from exc
+            raise AIProviderError(
+                f"OpenRouter request timed out after {self._timeout:.0f}s.",
+                provider="openrouter",
+                model=target_model,
+            ) from exc
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"OpenRouter request failed: {self._sanitize(str(exc))}") from exc
+            raise AIProviderError(
+                f"OpenRouter request failed: {self._sanitize(str(exc))}",
+                provider="openrouter",
+                model=target_model,
+            ) from exc
+
+    def _error_code(self, resp: httpx.Response) -> str | None:
+        """OpenRouter's ``error.code`` / ``error.type`` when present."""
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code") or error.get("type")
+            if code is not None:
+                return str(code)
+        return None
 
     def _sanitize(self, text: str) -> str:
         from nova.core.safety import redact_secrets

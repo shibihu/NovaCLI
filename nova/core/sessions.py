@@ -1,7 +1,13 @@
 """Persistent Chat Sessions Subsystem for NovaCLI.
 
-Saves conversation transcripts and metadata in `.nova/sessions/<session_id>/`
-separated from agent checkpoints.
+Saves the canonical conversation (``Message[]``) and metadata in
+`.nova/sessions/<session_id>/`, separated from agent checkpoints.
+
+The stored ``messages`` list is the *canonical* conversation the LLM was given —
+user turns, assistant turns, tool calls and tool results — not a transcript of
+``AgentEvent`` progress notifications. Session files written by older releases
+stored an event list instead; those are detected and converted on read
+(:meth:`ChatSession.is_legacy_history`), never silently corrupted.
 """
 
 from __future__ import annotations
@@ -13,14 +19,24 @@ import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from nova.core.models import to_jsonable, utc_now_iso
+from nova.core.conversation import (
+    CONVERSATION_SCHEMA_VERSION,
+    is_canonical_history,
+    is_legacy_history,
+    messages_from_dicts,
+    messages_to_dicts,
+)
+from nova.core.models import Message, to_jsonable, utc_now_iso
 from nova.core.safety import SafetyError, redact_secrets
 from nova.workspace.files import Workspace
 
 _VALID_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 MAX_STORED_OUTPUT_CHARS = 4_000
+
+#: Any title that means "not named yet" — replaced by the first task's title.
+PLACEHOLDER_TITLES = frozenset({"", "new chat", "untitled chat"})
 
 
 def _is_safe_rel_path(path_str: str) -> bool:
@@ -62,6 +78,8 @@ def generate_chat_title(task: str) -> str:
 
 @dataclass
 class ChatSession:
+    """One persistent chat: metadata plus its canonical conversation."""
+
     id: str
     project_root: str
     title: str
@@ -70,19 +88,59 @@ class ChatSession:
     model: str = ""
     status: str = "done"
     messages: list[dict[str, Any]] = field(default_factory=list)
+    schema_version: int = CONVERSATION_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return to_jsonable(asdict(self))
 
-    def to_messages(self) -> list[Any]:
-        """Reconstruct canonical list of Message objects from session history."""
-        from nova.core.models import Message
+    @property
+    def has_placeholder_title(self) -> bool:
+        """True while the chat still carries its generated "New Chat" title."""
+        return (self.title or "").strip().lower() in PLACEHOLDER_TITLES
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.messages
+
+    def is_legacy_history(self) -> bool:
+        """True for session files written before canonical persistence.
+
+        Those files stored a raw ``AgentEvent`` list (entries with ``type`` and
+        no ``role``). Anything already in canonical shape is treated as such
+        even if the version marker was lost.
+        """
+        if is_legacy_history(self.messages):
+            return True
+        if self.schema_version >= CONVERSATION_SCHEMA_VERSION:
+            return False
+        return not is_canonical_history(self.messages)
+
+    def to_messages(self) -> list[Message]:
+        """Return the canonical conversation as :class:`Message` objects."""
+        if self.is_legacy_history():
+            return self._legacy_messages_from_events()
+        return messages_from_dicts(self.messages)
+
+    def _legacy_messages_from_events(self) -> list[Message]:
+        """Best-effort conversion of a pre-canonical event list.
+
+        Internal ``thought``/``progress``/``step_start`` notifications are
+        deliberately **not** turned into assistant messages: they were UI
+        status output, and replaying them to a provider would fabricate a
+        conversation the model never had.
+        """
         messages: list[Message] = []
         raw_items = self.messages
         if not raw_items:
             return messages
 
-        current_tool_calls = []
+        current_tool_calls: list[dict[str, Any]] = []
+
+        def flush_tool_calls() -> None:
+            nonlocal current_tool_calls
+            if current_tool_calls:
+                messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
+                current_tool_calls = []
 
         for item in raw_items:
             if not isinstance(item, dict):
@@ -93,7 +151,7 @@ class ChatSession:
                 if item.get("content"):
                     messages.append(Message(role=role, content=str(item["content"])))
                 continue
-            elif role == "assistant":
+            if role == "assistant":
                 messages.append(
                     Message(
                         role="assistant",
@@ -102,7 +160,7 @@ class ChatSession:
                     )
                 )
                 continue
-            elif role == "tool":
+            if role == "tool":
                 messages.append(
                     Message(
                         role="tool",
@@ -118,13 +176,8 @@ class ChatSession:
 
             if evt_type == "agent_start":
                 task_text = data.get("task")
-                if task_text and not messages:
+                if task_text and not any(m.role == "user" for m in messages):
                     messages.append(Message.user(str(task_text)))
-
-            elif evt_type == "thought":
-                text = data.get("text")
-                if text:
-                    messages.append(Message.assistant(content=str(text)))
 
             elif evt_type == "tool_call":
                 tc_id = data.get("id") or f"call_{len(messages)}"
@@ -132,7 +185,7 @@ class ChatSession:
                 t_input = data.get("input") or {}
 
                 raw_args = json.dumps(t_input) if isinstance(t_input, dict) else str(t_input)
-                tc_dict = {
+                tc_dict: dict[str, Any] = {
                     "id": tc_id,
                     "type": "function",
                     "function": {
@@ -140,16 +193,15 @@ class ChatSession:
                         "arguments": raw_args,
                     },
                 }
-                if data.get("thought_signature"):
-                    tc_dict["thought_signature"] = data["thought_signature"]
-                    tc_dict["function"]["thought_signature"] = data["thought_signature"]
+                signature = data.get("thought_signature")
+                if signature:
+                    tc_dict["thought_signature"] = signature
+                    tc_dict["function"]["thought_signature"] = signature
 
                 current_tool_calls.append(tc_dict)
 
             elif evt_type in ("tool_result", "blocked"):
-                if current_tool_calls:
-                    messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
-                    current_tool_calls.clear()
+                flush_tool_calls()
 
                 tc_id = data.get("tool_call_id") or data.get("id") or f"call_{len(messages)}"
                 t_name = data.get("name") or data.get("tool") or "tool"
@@ -157,19 +209,13 @@ class ChatSession:
                 messages.append(Message.tool_result(tc_id, t_name, str(t_out)))
 
             elif evt_type == "final":
-                if current_tool_calls:
-                    messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
-                    current_tool_calls.clear()
+                flush_tool_calls()
                 answer = data.get("answer")
                 if answer:
                     messages.append(Message.assistant(content=str(answer)))
 
-        if current_tool_calls:
-            messages.append(Message.assistant(content=None, tool_calls=list(current_tool_calls)))
-            current_tool_calls.clear()
-
+        flush_tool_calls()
         return messages
-
 
 
 class SessionStorageManager:
@@ -216,16 +262,26 @@ class SessionStorageManager:
             raise ValueError(f"Invalid session ID: {session_id!r}")
         return clean_id
 
-    def _redact_data(self, data: Any) -> Any:
+    def _redact_data(self, data: Any, *, truncate: bool = True) -> Any:
+        """Redact secrets; optionally cap string length.
+
+        Canonical conversations are redacted but **not** truncated: a tool
+        result is part of the conversation the model will be shown again, so
+        silently shortening it would corrupt the session.
+        """
         if isinstance(data, str):
             res = redact_secrets(data, *self._secrets)
-            if len(res) > MAX_STORED_OUTPUT_CHARS:
+            if truncate and len(res) > MAX_STORED_OUTPUT_CHARS:
                 return res[:MAX_STORED_OUTPUT_CHARS] + f"\n… [truncated {len(res) - MAX_STORED_OUTPUT_CHARS} chars]"
             return res
         if isinstance(data, dict):
-            return {k: self._redact_data(v) for k, v in data.items() if k not in ("authorization", "api_key", "secret")}
+            return {
+                k: self._redact_data(v, truncate=truncate)
+                for k, v in data.items()
+                if k not in ("authorization", "api_key", "secret")
+            }
         if isinstance(data, list):
-            return [self._redact_data(v) for v in data]
+            return [self._redact_data(v, truncate=truncate) for v in data]
         return data
 
     def create(
@@ -249,13 +305,32 @@ class SessionStorageManager:
             model=model,
             status="pending",
             messages=[],
+            schema_version=CONVERSATION_SCHEMA_VERSION,
         )
 
         self.save(session)
         return session
 
-    def save(self, session: ChatSession) -> None:
-        """Save chat session manifest safely with secret redaction and output truncation."""
+    def replace_history(self, session_id: str, messages: Iterable[Message]) -> ChatSession | None:
+        """Overwrite a session's canonical conversation with ``messages``.
+
+        The caller is responsible for :meth:`save`. Returns ``None`` when the
+        session does not exist (or is not owned by this workspace).
+        """
+        sess = self.get(session_id)
+        if sess is None:
+            return None
+        sess.schema_version = CONVERSATION_SCHEMA_VERSION
+        sess.messages = messages_to_dicts(messages)
+        return sess
+
+    def save(self, session: ChatSession, *, touch: bool = True) -> None:
+        """Save chat session manifest with secret redaction.
+
+        ``touch=False`` leaves ``updated_at`` alone so metadata-only writes do
+        not reshuffle Recent Chats; a real conversation update is one logical
+        write (see :meth:`replace_history`).
+        """
         sid = self._validate_id(session.id)
         s_dir = (self.sessions_dir / sid).resolve()
 
@@ -264,11 +339,14 @@ class SessionStorageManager:
 
         s_dir.mkdir(parents=True, exist_ok=True)
 
-        session.updated_at = utc_now_iso()
-        data = self._redact_data(session.to_dict())
+        if touch:
+            session.updated_at = utc_now_iso()
+        legacy = session.is_legacy_history()
+        data = self._redact_data(session.to_dict(), truncate=legacy)
+        data["schema_version"] = session.schema_version
 
         manifest_file = s_dir / "manifest.json"
-        manifest_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        manifest_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def get(self, session_id: str) -> ChatSession | None:
         """Load session record enforcing workspace root containment and schema checks."""
@@ -302,6 +380,10 @@ class SessionStorageManager:
             model = data.get("model") or ""
             status = data.get("status") or "done"
             messages = data.get("messages") or []
+            # 0 means "written before canonical persistence"; the message shape
+            # then decides between canonical and legacy handling.
+            raw_version = data.get("schema_version")
+            schema_version = raw_version if isinstance(raw_version, int) else 0
 
             return ChatSession(
                 id=sid,
@@ -312,6 +394,7 @@ class SessionStorageManager:
                 model=model,
                 status=status,
                 messages=messages if isinstance(messages, list) else [],
+                schema_version=schema_version,
             )
         except (json.JSONDecodeError, OSError, TypeError):
             return None
@@ -370,6 +453,7 @@ class SessionStorageManager:
 
 __all__ = [
     "ChatSession",
+    "PLACEHOLDER_TITLES",
     "SessionStorageManager",
     "generate_chat_title",
 ]

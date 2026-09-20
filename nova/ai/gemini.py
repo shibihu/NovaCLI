@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from nova.core.models import AIResponse, ToolCall
-from . import AIProviderError, MissingAPIKeyError
+from . import AIProviderError, MissingAPIKeyError, retry_after_from_headers
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_TIMEOUT = 60.0
@@ -41,6 +41,10 @@ class GeminiProvider:
         self._timeout = max(1.0, float(timeout))
         self._client = client
         self._owns_client = client is None
+
+    @property
+    def provider_id(self) -> str:
+        return "gemini"
 
     @property
     def model_name(self) -> str:
@@ -115,22 +119,63 @@ class GeminiProvider:
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         try:
             resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code == 401 or resp.status_code == 403:
-                raise MissingAPIKeyError(f"Gemini rejected the API key (HTTP {resp.status_code}). {MISSING_KEY_HINT}")
+            if resp.status_code in (401, 403):
+                raise MissingAPIKeyError(
+                    f"Gemini rejected the API key (HTTP {resp.status_code}). {MISSING_KEY_HINT}",
+                    status_code=resp.status_code,
+                    provider="gemini",
+                    model=target_model,
+                    is_permanent=True,
+                )
             if resp.status_code != 200:
                 error_body = self._sanitize(resp.text[:300])
-                raise AIProviderError(f"Gemini returned HTTP {resp.status_code}: {error_body}")
+                raise AIProviderError(
+                    f"Gemini returned HTTP {resp.status_code}: {error_body}",
+                    status_code=resp.status_code,
+                    retry_after=retry_after_from_headers(resp.headers),
+                    provider="gemini",
+                    model=target_model,
+                    error_code=self._error_code(resp),
+                    is_permanent=resp.status_code in (400, 404),
+                )
 
             data = resp.json()
             return self._extract_response(data)
         except MissingAPIKeyError:
             raise
         except httpx.ConnectError as exc:
-            raise AIProviderError(f"Could not reach Gemini ({type(exc).__name__}): {self._sanitize(str(exc))}") from exc
+            raise AIProviderError(
+                f"Could not reach Gemini ({type(exc).__name__}): {self._sanitize(str(exc))}",
+                provider="gemini",
+                model=target_model,
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise AIProviderError(f"Gemini request timed out after {self._timeout:.0f}s.") from exc
+            raise AIProviderError(
+                f"Gemini request timed out after {self._timeout:.0f}s.",
+                provider="gemini",
+                model=target_model,
+            ) from exc
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"Gemini request failed: {self._sanitize(str(exc))}") from exc
+            raise AIProviderError(
+                f"Gemini request failed: {self._sanitize(str(exc))}",
+                provider="gemini",
+                model=target_model,
+            ) from exc
+
+    def _error_code(self, resp: httpx.Response) -> str | None:
+        """Gemini's ``error.status`` (``RESOURCE_EXHAUSTED`` …) when present."""
+        try:
+            payload = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            status = error.get("status") or error.get("code")
+            if status is not None:
+                return str(status)
+        return None
 
     def _sanitize(self, text: str) -> str:
         from nova.core.safety import redact_secrets

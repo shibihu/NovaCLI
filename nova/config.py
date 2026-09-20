@@ -271,6 +271,10 @@ class Settings:
     api_key_source: str = "none"
     web_token: str | None = None
     reasoning_effort: str | None = None
+    #: Retry a provider call that failed with a temporary rate limit.
+    rate_limit_retry: bool = True
+    #: Seconds to wait when the provider sent no usable Retry-After hint.
+    rate_limit_fallback_seconds: int = 60
     execution_backend: str = "local"
     docker_image: str = "python:3.12-slim"
     extra_ignore: tuple[str, ...] = ()

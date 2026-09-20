@@ -255,3 +255,120 @@ async def test_gemini_normal_text_response_works():
 def test_non_gemini_tool_calls_unaffected():
     tc = ToolCall(id="call_groq_1", name="project_summary", arguments={}, raw_arguments="{}")
     assert tc.provider_data == {}
+
+
+# ---------------------------------------------------------------------------
+# Persistence round trip: response -> persist -> restart -> next request
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_thought_signature_survives_session_persistence(
+    monkeypatch, settings
+) -> None:
+    """``extra_content.google.thought_signature`` must survive a restart.
+
+    A restored Gemini conversation that lost its signature would be rejected on
+    the next tool-calling turn, so this is asserted end to end: the exact
+    structure received from Gemini is written to disk, reloaded by a brand new
+    application instance, and replayed in the next request's payload.
+    """
+    pytest.importorskip("fastapi", reason="fastapi is required for the web tests")
+    from fastapi.testclient import TestClient
+
+    from nova.web.app import create_app
+
+    sent_payloads: list[dict] = []
+
+    def mock_transport(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode("utf-8"))
+        sent_payloads.append(payload)
+        if len(sent_payloads) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_gemini_persist_1",
+                                        "type": "function",
+                                        "extra_content": {
+                                            "google": {
+                                                "thought_signature": "sig_persisted_abc"
+                                            }
+                                        },
+                                        "function": {
+                                            "name": "project_summary",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "Done."}}]},
+        )
+
+    def make_provider() -> GeminiProvider:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(mock_transport))
+        return GeminiProvider(api_key="gemini_test_key", client=client)
+
+    monkeypatch.setattr("nova.web.routes.get_provider", lambda _settings: make_provider())
+
+    def run(client: TestClient, task: str, session_id: str | None = None) -> str:
+        body: dict[str, object] = {"task": task}
+        if session_id:
+            body["session_id"] = session_id
+        created = client.post("/api/agent", json=body)
+        assert created.status_code == 201, created.text
+        sid = created.json()["session_id"]
+        with client.stream("GET", f"/api/agent/stream?session_id={sid}") as response:
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                event = json.loads(line[len("data:") :].strip())
+                if event["type"] in ("final", "error", "cancelled"):
+                    assert event["type"] == "final", event
+        return sid
+
+    with TestClient(create_app(settings)) as client:
+        sid = run(client, "summarize the project")
+        assert len(sent_payloads) == 2
+        stored = client.get(f"/api/agent/sessions/{sid}").json()["session"]["messages"]
+
+    signature = (
+        stored[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"]
+    )
+    assert signature == "sig_persisted_abc"
+    assert stored[2]["tool_call_id"] == "call_gemini_persist_1"
+
+    # The raw manifest on disk keeps the metadata verbatim.
+    manifest = (
+        settings.project_root / ".nova" / "sessions" / sid / "manifest.json"
+    ).read_text(encoding="utf-8")
+    assert "sig_persisted_abc" in manifest
+    assert "thought_signature" in manifest
+
+    # A fresh application instance (restart) continues the conversation.
+    with TestClient(create_app(settings)) as restarted:
+        run(restarted, "anything else?", session_id=sid)
+
+        assert len(sent_payloads) == 3
+        continuation_messages = sent_payloads[2]["messages"]
+        assistant = next(m for m in continuation_messages if m["role"] == "assistant")
+        tool_call = assistant["tool_calls"][0]
+        assert tool_call["id"] == "call_gemini_persist_1"
+        assert tool_call["extra_content"]["google"]["thought_signature"] == (
+            "sig_persisted_abc"
+        )
+        tool_message = next(m for m in continuation_messages if m["role"] == "tool")
+        assert tool_message["tool_call_id"] == "call_gemini_persist_1"
+
+        # The prior turn is replayed once, not duplicated.
+        assert sum(1 for m in continuation_messages if m["role"] == "user") == 2

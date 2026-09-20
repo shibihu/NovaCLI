@@ -14,7 +14,7 @@ from typing import Any
 from nova.config import API_KEY_HINT
 from nova.core.models import AIResponse, ToolCall
 
-from . import AIProviderError, MissingAPIKeyError
+from . import AIProviderError, MissingAPIKeyError, retry_after_from_headers
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TIMEOUT = 60.0
@@ -46,6 +46,10 @@ class GroqProvider:
         self._reasoning_effort = reasoning_effort
         self._client = client
         self._owns_client = client is None
+
+    @property
+    def provider_id(self) -> str:
+        return "groq"
 
     @property
     def model_name(self) -> str:
@@ -139,29 +143,44 @@ class GroqProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            status_code = getattr(exc, "status_code", None)
+            status_code = getattr(exc, "status_code", None) or (
+                429 if "429" in str(exc) else None
+            )
             response = getattr(exc, "response", None)
             headers = getattr(response, "headers", None) if response else None
 
-            retry_after = None
-            if headers:
-                ra_val = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
-                if ra_val:
-                    try:
-                        retry_after = int(float(ra_val))
-                    except (ValueError, TypeError):
-                        pass
+            # ``Retry-After: 60``, an HTTP-date, or Groq's ``2m59s`` resets.
+            retry_after = retry_after_from_headers(headers)
 
             desc = self._describe_error(exc)
             raise AIProviderError(
                 desc,
-                status_code=status_code or (429 if "429" in str(exc) else None),
+                status_code=status_code,
                 retry_after=retry_after,
                 provider="groq",
                 model=self._model,
+                error_code=self._error_code(exc),
+                is_permanent=status_code in (401, 403),
             ) from exc
 
         return self._extract_response(response)
+
+    @staticmethod
+    def _error_code(exc: Exception) -> str | None:
+        """Provider error code (``invalid_api_key`` …) when the SDK exposes one."""
+        code = getattr(exc, "code", None)
+        if isinstance(code, str) and code:
+            return code
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                nested = error.get("code") or error.get("type")
+                if isinstance(nested, str) and nested:
+                    return nested
+            if isinstance(body.get("code"), str):
+                return body["code"]
+        return None
 
     def _describe_error(self, exc: Exception) -> str:
         name = type(exc).__name__

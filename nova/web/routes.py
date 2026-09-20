@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from nova.ai import AIProviderError, get_provider
 from nova.config import get_api_key_hint, NovaConfigStore, Settings
 from nova.core.agent import AgentController, build_agent
-from nova.core.sessions import SessionStorageManager
+from nova.core.sessions import SessionStorageManager, generate_chat_title
 from nova.core.checkpoints import CheckpointManager
 from nova.core.git import GitService
 from nova.core.models import ApprovalDecision, RiskLevel
@@ -398,8 +398,17 @@ async def start_agent(request: Request, body: AgentRequest) -> JSONResponse:
     if body.session_id:
         p_sess = mgr.get(body.session_id)
     if not p_sess:
-        p_sess = mgr.create(task=body.task, session_id=body.session_id, model=settings.model)
+        try:
+            p_sess = mgr.create(task=body.task, session_id=body.session_id, model=settings.model)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
+    # A brand new chat keeps its generated title until the first real task.
+    if p_sess.is_empty and p_sess.has_placeholder_title:
+        p_sess.title = generate_chat_title(body.task)
+        mgr.save(p_sess, touch=False)
+
+    # Canonical conversation restored from disk — never rebuilt from display text.
     reconstructed_history = p_sess.to_messages()
 
     controller = AgentController(
@@ -459,7 +468,10 @@ async def create_chat_session(request: Request, body: SessionCreateBody | None =
     title = body.title if body and body.title else None
     session_id = body.session_id if body else None
 
-    sess = mgr.create(task=task, session_id=session_id, title=title, model=settings.model)
+    try:
+        sess = mgr.create(task=task, session_id=session_id, title=title, model=settings.model)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     return {"ok": True, "session": sess.to_dict()}
 
 
@@ -478,6 +490,7 @@ async def list_chat_sessions(request: Request) -> dict[str, Any]:
             "updated_at": s.updated_at,
             "status": s.status,
             "model": s.model,
+            "message_count": len(s.messages),
         }
 
     for mem_s in registry.list():

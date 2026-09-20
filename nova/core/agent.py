@@ -18,13 +18,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from nova.ai import AIProvider, AIProviderError, RateLimitInfo, parse_rate_limit_info, parse_rate_limit_info
+from nova.ai import AIProvider, AIProviderError, RateLimitInfo, parse_rate_limit_info
 from nova.config import Settings, load_settings
 from nova.workspace.files import Workspace
 from nova.workspace.projects import ProjectAnalyzer
 from nova.core.checkpoints import CheckpointManager
 
 from .context import ContextBuilder
+from .conversation import ConversationTrace, trim_history
 from .models import (
     AgentEvent,
     AgentResult,
@@ -600,6 +601,14 @@ class NovaAgent:
         self.max_steps = max_steps or self.settings.max_steps
         self.system_prompt = system_prompt or SYSTEM_PROMPT
 
+    @property
+    def provider_id(self) -> str:
+        """Canonical provider name (never ``provider/model``)."""
+        name = getattr(self.provider, "provider_id", None)
+        if isinstance(name, str) and name:
+            return name
+        return type(self.provider).__name__.replace("Provider", "").lower()
+
     def system_message(self) -> Message:
         return Message.system(self.system_prompt)
 
@@ -609,7 +618,9 @@ class NovaAgent:
         context = self.context_builder.build(task)
         messages: list[Message] = [self.system_message()]
         if history:
-            messages.extend(list(history)[-MAX_HISTORY_MESSAGES:])
+            # The agent owns the system prompt; a stored one would duplicate it.
+            prior = [m for m in history if getattr(m, "role", None) != "system"]
+            messages.extend(trim_history(prior, MAX_HISTORY_MESSAGES))
         messages.append(
             Message.user(f"{context.text}\n\n# Task\n{task}")
         )
@@ -622,7 +633,14 @@ class NovaAgent:
         history: Sequence[Message] | None = None,
         controller: AgentController | None = None,
         max_steps: int | None = None,
+        trace: ConversationTrace | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        """Run one task, yielding progress events.
+
+        Pass a :class:`~nova.core.conversation.ConversationTrace` to observe the
+        canonical ``Message[]`` the run builds — that is what gets persisted as
+        the session, instead of re-deriving history from these events.
+        """
         controller = controller or AgentController()
         limit = max_steps or self.max_steps
 
@@ -653,6 +671,11 @@ class NovaAgent:
         except (OSError, ValueError) as exc:
             yield AgentEvent(EventType.ERROR, {"message": f"Could not read the project: {exc}"})
             return
+
+        if trace is not None:
+            # The trace keeps a live reference: the agent only ever appends to
+            # this list, so the caller sees every canonical turn as it happens.
+            trace.attach(messages, task)
 
         if files:
             yield AgentEvent(EventType.PROGRESS, {"files": files, "percent": 5})
@@ -685,7 +708,8 @@ class NovaAgent:
                     )
                     break
                 except AIProviderError as exc:
-                    rl_info = parse_rate_limit_info(exc, provider_name=self.provider.model_name)
+                    provider_id = self.provider_id
+                    rl_info = parse_rate_limit_info(exc, provider_name=provider_id)
                     retry_enabled = getattr(self.settings, "rate_limit_retry", True) if hasattr(self, "settings") else True
 
                     if rl_info.is_rate_limit and not rl_info.is_permanent and retry_enabled and retry_count < max_retries:
@@ -696,7 +720,11 @@ class NovaAgent:
                         yield AgentEvent(
                             EventType.RATE_LIMIT_WAIT,
                             {
-                                "provider": self.provider.model_name,
+                                # provider and model stay separate: provider is
+                                # "gemini", model is "gemini-2.5-flash".
+                                "provider": provider_id,
+                                "model": self.provider.model_name,
+                                "status_code": rl_info.status_code,
                                 "retry_after": delay_seconds,
                                 "limit_type": rl_info.limit_type,
                                 "reason": rl_info.reason or "per-minute rate limit",
@@ -868,6 +896,9 @@ class NovaAgent:
 
             if decision.is_final:
                 steps.append(AgentStep(index=index, thought=decision.thought, final_answer=decision.final))
+                # The answer is the assistant's last canonical turn; recording it
+                # keeps a restored session a complete User/Assistant pair.
+                messages.append(Message.assistant(decision.final))
                 yield AgentEvent(EventType.PROGRESS, {"percent": 100}, step=index)
                 inspection = self.checkpoint_manager.inspect(checkpoint_id)
                 changed_files = inspection.get("changed_files", [])

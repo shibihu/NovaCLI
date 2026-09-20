@@ -129,11 +129,13 @@ def test_session_workspace_isolation(tmp_path: Path):
     assert res_traversal.status_code == 404
 
 
-def test_session_to_messages_reconstruction(tmp_path: Path):
+def test_legacy_event_history_is_converted_without_thought_pollution(tmp_path: Path):
+    """Pre-canonical session files still load, but thoughts never become turns."""
     ws = Workspace(tmp_path)
     mgr = SessionStorageManager(ws)
 
     sess = mgr.create(task="Fix Ollama tool calling", model="openai/gpt-oss-20b")
+    sess.schema_version = 0  # what an older release wrote
     sess.messages = [
         {
             "type": "agent_start",
@@ -169,20 +171,27 @@ def test_session_to_messages_reconstruction(tmp_path: Path):
 
     loaded = mgr.get(sess.id)
     assert loaded is not None
+    assert loaded.is_legacy_history() is True
 
     messages = loaded.to_messages()
-    assert len(messages) == 5
+    # user, assistant(tool_calls), tool, assistant(final) — the "thought"
+    # event must not become an assistant turn.
+    assert len(messages) == 4
     assert messages[0].role == "user"
     assert messages[0].content == "Fix Ollama tool calling"
 
     assert messages[1].role == "assistant"
-    assert messages[1].content == "I will search for ollama provider file."
+    assert messages[1].tool_calls is not None
+    assert messages[1].tool_calls[0]["id"] == "call_123"
+    assert messages[1].tool_calls[0]["thought_signature"] == "sig_google_gemini_123"
 
-    assert messages[2].role == "assistant"
-    assert messages[2].tool_calls is not None
-    assert messages[2].tool_calls[0]["id"] == "call_123"
-    assert messages[2].tool_calls[0]["thought_signature"] == "sig_google_gemini_123"
+    assert messages[2].role == "tool"
+    assert messages[2].tool_call_id == "call_123"
+    assert "nova/ai/ollama.py" in messages[2].content
 
-    assert messages[3].role == "tool"
-    assert messages[3].tool_call_id == "call_123"
-    assert "nova/ai/ollama.py" in messages[3].content
+    assert messages[3].role == "assistant"
+    assert messages[3].content == "Fixed Ollama tool calling."
+    assert not any(
+        m.role == "assistant" and (m.content or "").startswith("I will search")
+        for m in messages
+    )

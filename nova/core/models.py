@@ -132,24 +132,33 @@ class AIResponse:
 
 @dataclass
 class Message:
-    """A single chat turn in the provider-agnostic OpenAI-style shape."""
+    """A single chat turn in the provider-agnostic OpenAI-style shape.
+
+    ``tool_calls`` keeps the provider's exact structure (including vendor
+    extensions such as ``extra_content.google.thought_signature``) and
+    ``provider_data`` carries any message-level provider metadata, so a
+    persisted conversation can be replayed to the same provider unchanged.
+    """
 
     role: str
     content: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    provider_data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"role": self.role}
         if self.content is not None:
             data["content"] = self.content
         if self.tool_calls is not None:
-            data["tool_calls"] = self.tool_calls
+            data["tool_calls"] = to_jsonable(self.tool_calls)
         if self.tool_call_id is not None:
             data["tool_call_id"] = self.tool_call_id
         if self.name is not None:
             data["name"] = self.name
+        if self.provider_data:
+            data["provider_data"] = to_jsonable(self.provider_data)
         return data
 
     @classmethod

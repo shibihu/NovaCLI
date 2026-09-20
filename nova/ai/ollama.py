@@ -42,6 +42,10 @@ class OllamaProvider:
         self._owns_client = client is None
 
     @property
+    def provider_id(self) -> str:
+        return "ollama"
+
+    @property
     def model_name(self) -> str:
         return self._model
 

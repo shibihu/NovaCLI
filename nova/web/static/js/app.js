@@ -88,7 +88,19 @@
 
   // --- Chat -------------------------------------------------------------
 
-  const state = { sessionId: null, source: null, busy: false, approvalId: null };
+  const state = {
+    // Persistent chat session id (also the id of the agent run behind it).
+    activeChatSessionId: null,
+    chatSessions: [],
+    defaultModel: "",
+    source: null,
+    busy: false,
+    approvalId: null,
+  };
+
+  // Kept so the empty state (with its suggestions) can be restored after
+  // switching to another chat or starting a new one.
+  const EMPTY_CHAT_HTML = $("messages") ? $("messages").innerHTML : "";
 
   function addMessage(html, className) {
     $("chat-empty")?.remove();
@@ -120,6 +132,256 @@
     $("send").disabled = busy;
     $("stop").classList.toggle("hidden", !busy);
     setStatus(busy ? "busy" : "ok", busy ? "working" : "ready");
+  }
+
+  // --- Recent chats ------------------------------------------------------
+
+  function relativeTime(value) {
+    const then = Date.parse(value || "");
+    if (!Number.isFinite(then)) return "";
+    const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (seconds < 60) return "just now";
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + "m ago";
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return hours + "h ago";
+    const days = Math.round(hours / 24);
+    if (days < 30) return days + "d ago";
+    return new Date(then).toLocaleDateString();
+  }
+
+  function sessionSortKey(session) {
+    return session.updated_at || session.created_at || "";
+  }
+
+  function setActiveChatTitle(title) {
+    const el = $("active-chat-title");
+    if (el) el.textContent = title || "New Chat";
+  }
+
+  function syncActiveChatTitle() {
+    const current = state.chatSessions.find((s) => s.id === state.activeChatSessionId);
+    setActiveChatTitle(current ? current.title : "New Chat");
+  }
+
+  function renderChatSessions() {
+    const list = $("chat-session-list");
+    if (!list) return;
+    if (!state.chatSessions.length) {
+      list.innerHTML = '<li class="muted small session-empty">No saved chats yet</li>';
+      return;
+    }
+    list.innerHTML = "";
+    state.chatSessions.forEach((session) => {
+      const li = document.createElement("li");
+      li.className = "session-item" + (session.id === state.activeChatSessionId ? " is-active" : "");
+      li.dataset.sessionId = session.id;
+      li.setAttribute("role", "button");
+      li.tabIndex = 0;
+      li.innerHTML =
+        '<span class="session-title">' +
+        esc(session.title || "New Chat") +
+        '</span><span class="session-meta">' +
+        esc(relativeTime(sessionSortKey(session))) +
+        "</span>";
+      li.addEventListener("click", () => openChatSession(session.id));
+      li.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openChatSession(session.id);
+        }
+      });
+      list.appendChild(li);
+    });
+  }
+
+  async function loadChatSessions() {
+    const list = $("chat-session-list");
+    try {
+      const data = await api("/api/agent/sessions");
+      state.chatSessions = (data.sessions || [])
+        .slice()
+        .sort((left, right) => (sessionSortKey(left) < sessionSortKey(right) ? 1 : -1));
+      renderChatSessions();
+      syncActiveChatTitle();
+    } catch (error) {
+      if (list) {
+        list.innerHTML = '<li class="muted small session-empty">' + esc(error.message) + "</li>";
+      }
+    }
+  }
+
+  /** Render a *persisted* canonical conversation (never the event transcript). */
+  function renderConversation(messages) {
+    const box = $("messages");
+    if (!box) return;
+    const entries = (messages || []).filter((m) => m && m.role && m.role !== "system");
+    if (!entries.length) {
+      box.innerHTML = EMPTY_CHAT_HTML;
+      return;
+    }
+
+    const html = [];
+    entries.forEach((message) => {
+      if (message.role === "user") {
+        html.push('<div class="msg user"><p>' + esc(message.content || "") + "</p></div>");
+        return;
+      }
+      if (message.role === "assistant") {
+        (message.tool_calls || []).forEach((call) => {
+          const fn = (call && call.function) || {};
+          html.push(
+            '<div class="msg step"><div class="msg-head"><span>🔧 tool</span><span class="badge">' +
+              esc(fn.name || "tool") +
+              "</span></div><p>" +
+              esc(truncate(fn.arguments || "{}", 260)) +
+              "</p></div>"
+          );
+        });
+        if (message.content) {
+          html.push(
+            '<div class="msg agent"><div class="msg-head"><span>Nova</span></div>' +
+              renderMarkdown(message.content) +
+              "</div>"
+          );
+        }
+        return;
+      }
+      if (message.role === "tool") {
+        html.push(
+          '<div class="msg step"><div class="msg-head"><span class="status-dot ok"></span><span>' +
+            esc(message.name || "tool") +
+            '</span></div><details class="tool-out"><summary>output</summary><pre>' +
+            esc(truncate(message.content || "(no output)", 4000)) +
+            "</pre></details></div>"
+        );
+      }
+    });
+
+    box.innerHTML = html.join("");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function clearConversation() {
+    renderConversation([]);
+  }
+
+  function resetToNewChat() {
+    closeStream();
+    state.activeChatSessionId = null;
+    clearConversation();
+    setActiveChatTitle("New Chat");
+    if (state.defaultModel) $("chip-model").textContent = state.defaultModel;
+    renderChatSessions();
+  }
+
+  function focusComposer() {
+    const input = $("task");
+    if (input && !state.busy) input.focus();
+  }
+
+  function collapseSidebar() {
+    const sidebar = $("chat-sidebar");
+    if (sidebar && window.matchMedia("(max-width: 719px)").matches) {
+      sidebar.classList.add("is-collapsed");
+    }
+  }
+
+  function toggleSidebar() {
+    const sidebar = $("chat-sidebar");
+    if (sidebar) sidebar.classList.toggle("is-collapsed");
+  }
+
+  async function openChatSession(sessionId) {
+    if (!sessionId || sessionId === state.activeChatSessionId) {
+      collapseSidebar();
+      return;
+    }
+    if (state.busy) {
+      toast("Nova is still working — stop it before switching chats.", "error");
+      return;
+    }
+    try {
+      const data = await api("/api/agent/sessions/" + encodeURIComponent(sessionId));
+      const session = data.session || {};
+      closeStream();
+      state.activeChatSessionId = session.id || sessionId;
+      setActiveChatTitle(session.title || "New Chat");
+      if (session.model) $("chip-model").textContent = session.model;
+      renderConversation(session.messages);
+      renderChatSessions();
+      collapseSidebar();
+      focusComposer();
+    } catch (error) {
+      toast("Could not open chat: " + error.message, "error");
+    }
+  }
+
+  async function newChat() {
+    if (state.busy) {
+      toast("Nova is still working — stop it before starting a new chat.", "error");
+      return;
+    }
+    try {
+      const data = await api("/api/agent/sessions", { method: "POST" });
+      const session = data.session || {};
+      resetToNewChat();
+      state.activeChatSessionId = session.id || null;
+      setActiveChatTitle(session.title || "New Chat");
+      await loadChatSessions();
+      collapseSidebar();
+      focusComposer();
+    } catch (error) {
+      toast("Could not start a new chat: " + error.message, "error");
+    }
+  }
+
+  async function renameActiveChat() {
+    const sessionId = state.activeChatSessionId;
+    if (!sessionId) {
+      toast("No chat selected", "error");
+      return;
+    }
+    const current = state.chatSessions.find((s) => s.id === sessionId);
+    const suggestion = current ? current.title : $("active-chat-title").textContent;
+    const next = window.prompt("Rename chat", suggestion);
+    if (next === null) return;
+    const title = next.trim();
+    if (!title) return;
+    try {
+      const data = await api("/api/agent/sessions/" + encodeURIComponent(sessionId), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title }),
+      });
+      setActiveChatTitle((data.session || {}).title || title);
+      await loadChatSessions();
+      toast("Chat renamed", "ok");
+    } catch (error) {
+      toast("Rename failed: " + error.message, "error");
+    }
+  }
+
+  async function deleteActiveChat() {
+    const sessionId = state.activeChatSessionId;
+    if (!sessionId) {
+      toast("No chat selected", "error");
+      return;
+    }
+    const current = state.chatSessions.find((s) => s.id === sessionId);
+    const label = current ? current.title : "this chat";
+    if (!window.confirm('Delete "' + label + '"? This cannot be undone.')) return;
+
+    try {
+      await api("/api/agent/sessions/" + encodeURIComponent(sessionId), { method: "DELETE" });
+      // Never leave the UI pointing at a deleted session.
+      resetToNewChat();
+      await loadChatSessions();
+      focusComposer();
+      toast("Chat deleted", "ok");
+    } catch (error) {
+      toast("Delete failed: " + error.message, "error");
+    }
   }
 
 
@@ -277,6 +539,8 @@
         agentMessage("Nova", finalHtml);
         setProgress(100);
         setBusy(false);
+        // The turn (and possibly the generated title) is now persisted.
+        loadChatSessions();
         break;
 
       case "error":
@@ -287,6 +551,7 @@
           "error"
         );
         setBusy(false);
+        loadChatSessions();
         break;
 
       case "cancelled":
@@ -294,6 +559,7 @@
         $("approval-modal").classList.add("hidden");
         addMessage("<p>Cancelled.</p>", "thought");
         setBusy(false);
+        loadChatSessions();
         break;
     }
   }
@@ -331,6 +597,9 @@
 
   async function submitTask(task) {
     if (!task.trim() || state.busy) return;
+    // A restored conversation is drawn from persisted messages; a live run is
+    // drawn from the event stream. Collapse the empty state first.
+    $("chat-empty")?.remove();
     addMessage("<p>" + esc(task) + "</p>", "user");
     setBusy(true);
     setProgress(3);
@@ -339,9 +608,14 @@
       const created = await api("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: task }),
+        body: JSON.stringify({
+          task: task,
+          // Continue the active chat when there is one; omit it to let the
+          // server create a fresh session.
+          session_id: state.activeChatSessionId || undefined,
+        }),
       });
-      state.sessionId = created.session_id;
+      state.activeChatSessionId = created.session_id;
       openStream(created.session_id);
     } catch (error) {
       setBusy(false);
@@ -371,17 +645,19 @@
     }
   });
 
-  document.querySelectorAll(".suggestion").forEach((button) => {
-    button.addEventListener("click", () => submitTask(button.textContent.trim()));
+  // Delegated so the empty state can be re-created without rebinding.
+  $("messages").addEventListener("click", (event) => {
+    const button = event.target.closest(".suggestion");
+    if (button) submitTask(button.textContent.trim());
   });
 
   $("stop").addEventListener("click", async () => {
-    if (!state.sessionId) return;
+    if (!state.activeChatSessionId) return;
     try {
       await api("/api/agent/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: state.sessionId }),
+        body: JSON.stringify({ session_id: state.activeChatSessionId }),
       });
       toast("Stopping…");
     } catch (error) {
@@ -394,12 +670,16 @@
   async function decide(decision) {
     const requestId = state.approvalId;
     $("approval-modal").classList.add("hidden");
-    if (!requestId || !state.sessionId) return;
+    if (!requestId || !state.activeChatSessionId) return;
     try {
       await api("/api/agent/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: state.sessionId, request_id: requestId, decision: decision }),
+        body: JSON.stringify({
+          session_id: state.activeChatSessionId,
+          request_id: requestId,
+          decision: decision,
+        }),
       });
       state.approvalId = null;
       if (decision === "deny") addMessage("<p>Denied.</p>", "thought");
@@ -835,9 +1115,43 @@
 
   // --- Boot -------------------------------------------------------------
 
+  // --- Recent chats wiring ----------------------------------------------
+
+  function wireChatSidebar() {
+    const newChatBtn = $("btn-new-chat");
+    if (newChatBtn) newChatBtn.addEventListener("click", newChat);
+
+    const toggle = $("sidebar-toggle");
+    if (toggle) toggle.addEventListener("click", toggleSidebar);
+
+    const renameBtn = $("btn-rename-chat");
+    if (renameBtn) renameBtn.addEventListener("click", renameActiveChat);
+
+    const deleteBtn = $("btn-delete-chat");
+    if (deleteBtn) deleteBtn.addEventListener("click", deleteActiveChat);
+
+    // Tapping outside the drawer closes it (mobile only).
+    document.addEventListener("click", (event) => {
+      const sidebar = $("chat-sidebar");
+      if (!sidebar || sidebar.classList.contains("is-collapsed")) return;
+      if (!window.matchMedia("(max-width: 719px)").matches) return;
+      if (sidebar.contains(event.target)) return;
+      if (toggle && toggle.contains(event.target)) return;
+      sidebar.classList.add("is-collapsed");
+    });
+
+    const title = $("active-chat-title");
+    if (title) title.addEventListener("dblclick", renameActiveChat);
+  }
+
+  wireChatSidebar();
+
+  // --- Boot -------------------------------------------------------------
+
   async function boot() {
     try {
       const health = await api("/api/health");
+      state.defaultModel = health.model || "";
       $("chip-model").textContent = health.model;
       $("chip-safety").textContent = health.safety_mode;
       if (!health.has_api_key) {
@@ -849,6 +1163,9 @@
     } catch (error) {
       setStatus("error", "offline");
     }
+    // Recent Chats is loaded on startup; conversations open on demand so a
+    // reload never silently hijacks the current chat.
+    await loadChatSessions();
   }
 
   boot();
@@ -901,7 +1218,7 @@
           return;
         }
         try {
-          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.sessionId }) });
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.activeChatSessionId }) });
           let msg = "Rollback complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
           if (res.preserved && res.preserved.length > 0) {
             msg += " (" + res.preserved.length + " files preserved due to user conflicts)";
@@ -924,7 +1241,7 @@
           return;
         }
         try {
-          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/redo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.sessionId }) });
+          const res = await api("/api/agent/checkpoint/" + encodeURIComponent(cpId) + "/redo", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true, session_id: state.activeChatSessionId }) });
           let msg = "Redo complete: " + (res.restored ? res.restored.length : 0) + " restored, " + (res.removed ? res.removed.length : 0) + " removed.";
           if (res.preserved && res.preserved.length > 0) {
             msg += " (" + res.preserved.length + " files preserved due to post-undo conflicts)";

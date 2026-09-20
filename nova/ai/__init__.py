@@ -24,11 +24,101 @@ __all__ = [
     "provider_names",
     "RateLimitInfo",
     "parse_rate_limit_info",
+    "parse_retry_after",
+    "retry_after_from_headers",
 ]
 
 
+import math
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+#: Header names that carry a retry hint, in decreasing priority.
+RETRY_AFTER_HEADERS = (
+    "retry-after",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "x-ratelimit-reset",
+)
+
+#: Compact duration form used by Groq's reset headers, e.g. ``2m59.56s``.
+_DURATION_RE = re.compile(
+    r"^(?:(?P<minutes>\d+(?:\.\d+)?)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?$"
+)
+
+
+def parse_retry_after(value: Any) -> int | None:
+    """Normalise a ``Retry-After`` value into whole seconds.
+
+    Supports the forms providers actually emit:
+
+    * integer/float seconds — ``Retry-After: 60``
+    * an RFC 7231 HTTP-date — ``Retry-After: Wed, 21 Oct 2026 07:28:00 GMT``
+    * a compact duration — ``2m59.56s`` (Groq reset headers)
+
+    Returns ``None`` when the value cannot be interpreted.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        return seconds if seconds >= 0 else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Plain seconds: "60", "12.5", "17"
+    try:
+        seconds = int(float(text))
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None:
+        return seconds if seconds >= 0 else None
+
+    # Compact duration: "59s", "2m59.56s", "1m"
+    duration = _DURATION_RE.match(text)
+    if duration and (duration.group("minutes") or duration.group("seconds")):
+        total = 0.0
+        if duration.group("minutes"):
+            total += float(duration.group("minutes")) * 60
+        if duration.group("seconds"):
+            total += float(duration.group("seconds"))
+        return max(0, int(math.ceil(total)))
+
+    # RFC 7231 HTTP-date.
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = (parsed - datetime.now(timezone.utc)).total_seconds()
+    return max(0, int(math.ceil(delta)))
+
+
+def retry_after_from_headers(headers: Any) -> int | None:
+    """First parseable retry hint from an HTTP response's headers."""
+    if not headers:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    for name in RETRY_AFTER_HEADERS:
+        try:
+            raw = getter(name)
+        except Exception:  # noqa: BLE001 - malformed header mapping
+            continue
+        parsed = parse_retry_after(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
 
 @dataclass
 class RateLimitInfo:
@@ -38,6 +128,9 @@ class RateLimitInfo:
     provider: str = ""
     reason: str = ""
     is_permanent: bool = False
+    status_code: int | None = None
+    model: str = ""
+    error_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +138,9 @@ class RateLimitInfo:
             "retry_after": self.retry_after,
             "limit_type": self.limit_type,
             "provider": self.provider,
+            "model": self.model,
+            "status_code": self.status_code,
+            "error_code": self.error_code,
             "reason": self.reason,
             "is_permanent": self.is_permanent,
         }
@@ -72,16 +168,28 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
     p_model = ""
     retry_after = 0
     is_perm = False
+    status_code: int | None = None
+    error_code: str | None = None
 
     if isinstance(exc, AIProviderError):
         if exc.provider:
             p_name = exc.provider
         if exc.model:
             p_model = exc.model
+        if exc.status_code is not None:
+            status_code = exc.status_code
+        if exc.error_code:
+            error_code = exc.error_code
         if exc.retry_after is not None and exc.retry_after > 0:
             retry_after = exc.retry_after
         if exc.is_permanent:
             is_perm = True
+
+    # 401/403 and authentication/quota error codes are never worth retrying.
+    if status_code in (401, 403):
+        is_perm = True
+    if error_code and error_code.upper() in ("INVALID_API_KEY", "UNAUTHENTICATED", "PERMISSION_DENIED"):
+        is_perm = True
 
     msg = str(exc).lower()
 
@@ -92,6 +200,9 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
                 retry_after=0,
                 limit_type="DAILY_QUOTA" if "daily" in msg else "BILLING",
                 provider=p_name,
+                model=p_model,
+                status_code=status_code,
+                error_code=error_code,
                 reason="Quota or billing limit exhausted",
                 is_permanent=True,
             )
@@ -100,14 +211,24 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
             retry_after=0,
             limit_type="PERMANENT",
             provider=p_name,
+            model=p_model,
+            status_code=status_code,
+            error_code=error_code,
             reason="Authentication or authorization failed",
             is_permanent=True,
         )
 
     is_rl = ("rate limit" in msg or "429" in msg or "too many requests" in msg
              or "tpm" in msg or "rpm" in msg or "resource_exhausted" in msg)
-    if not is_rl and not retry_after and not (isinstance(exc, AIProviderError) and exc.status_code == 429):
-        return RateLimitInfo(is_rate_limit=False, provider=p_name)
+    if not is_rl and not retry_after and status_code != 429:
+        return RateLimitInfo(is_rate_limit=False, provider=p_name, model=p_model)
+
+    if not retry_after:
+        parsed_header = parse_retry_after(
+            _header_hint_from_message(str(exc))
+        )
+        if parsed_header is not None:
+            retry_after = parsed_header
 
     limit_type = "TPM" if "tpm" in msg or "token" in msg else "RPM"
 
@@ -132,9 +253,22 @@ def parse_rate_limit_info(exc: Exception, provider_name: str = "") -> RateLimitI
         retry_after=retry_after,
         limit_type=limit_type,
         provider=p_name,
+        model=p_model,
+        status_code=status_code,
+        error_code=error_code,
         reason=f"Per-minute {limit_type} rate limit reached",
         is_permanent=False,
     )
+
+
+def _header_hint_from_message(message: str) -> str | None:
+    """Pull a ``Retry-After: <value>`` hint out of a provider error string."""
+    match = re.search(
+        r"retry[-_\s]?after\s*[:=]\s*([^\n;,]+)", message, re.IGNORECASE
+    )
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
 class AIProviderError(Exception):
